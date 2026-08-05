@@ -19,6 +19,7 @@ ASN_SEARCH_URL = f"{HOST}/receiving/api/receiving/asn/search"
 ITEM_SEARCH_URL = f"{HOST}/item-master/api/item-master/item/search"
 LPN_RECEIVE_URL = f"{HOST}/receiving/api/receiving/lpn/receive"
 ILPN_GENERATE_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/generateIlpnIds"
+INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -353,3 +354,44 @@ def receive_lpn(
     if isinstance(body, dict):
         body["_requestPayload"] = payload
     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+
+
+def search_inventory_onhand_by_container(
+    container_ids: List[str], token: str, org: str, location: str = None
+) -> Dict[str, Decimal]:
+    """Sum OnHand per ILPN container id, via dcinventory's Inventory object.
+
+    This is the ground truth for received quantity — confirmed directly
+    against a live receive: a single lpn/receive call with Quantity=2
+    left the ASN's own Lpn[].LpnDetail[].ReportingUomQuantity at 1 (that
+    field does not reliably reflect quantities above 1), while this same
+    LPN's Inventory record correctly showed OnHand=2. Use this, not
+    LpnDetail, whenever the real received quantity matters.
+    """
+    clean = sorted({str(c).strip() for c in container_ids if str(c).strip()})
+    if not clean:
+        return {}
+    token = normalize_token(token)
+    quoted = ", ".join(f"'{c}'" for c in clean)
+    payload = {
+        "Query": f"InventoryContainerId in ({quoted}) and InventoryContainerTypeId ='ILPN'",
+        "Size": max(len(clean), 50),
+        "Page": 0,
+    }
+    response = _post(
+        INVENTORY_SEARCH_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json=payload,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"inventory search failed: {response.status_code} {response.text[:500]}"
+        )
+    out: Dict[str, Decimal] = {}
+    for row in _response_data_list(response.json()):
+        cid = str(row.get("InventoryContainerId") or "").strip()
+        if not cid:
+            continue
+        onhand = Decimal(str(row.get("OnHand") or 0))
+        out[cid] = out.get(cid, Decimal("0")) + onhand
+    return out

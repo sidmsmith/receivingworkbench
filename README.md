@@ -12,13 +12,18 @@ A desktop MAWM app for a warehouse dock worker to receive against an ASN.
   preloaded, receivable ASN.
 - Loads the ASN and displays its lines: Line #, Item (with a small item
   image thumbnail — hover to enlarge), Description, Shipped Qty, Received
-  Qty. Quantities are formatted exactly like MAWM's own RF Receiving UI
-  (verified against a live RF session capture) — converted from base units
-  into the item's pack UOM (Case, Pack, Pallet, etc.) via its
-  `ItemPackage[]` conversion table, shown as a mixed "{packs} {uom}
-  {remainder} units" string when it doesn't divide evenly (e.g.
-  "0 packs 1 units"), just the pack count when it does (e.g. "3 Case"),
-  and blank (not "0 <uom>") when nothing's been received yet.
+  Qty. Quantities are formatted exactly like MAWM's own UI (verified against
+  a live RF session capture and MAWM's own ASN-line report, both provided
+  by the user) — converted from base units into the item's pack UOM (Case,
+  Pack, Pallet, etc.) via its `ItemPackage[]` conversion table, shown as a
+  mixed "{packs} {uom} {remainder} units" string when it doesn't divide
+  evenly (e.g. "0 packs 1 units"), just the pack count when it does (e.g.
+  "3 Case"), and blank (not "0 <uom>") when nothing's been received yet.
+  Received quantity itself is summed from dcinventory's Inventory object
+  (`OnHand` per receive-created LPN) — the ASN's own nested
+  `Lpn[].LpnDetail[]` quantity fields were tried first and found unreliable
+  for a receive of more than 1 unit in a single call (see
+  `rw_service._received_qty_by_asn_line`'s docstring for the full story).
 - Click a line to select it, then:
   - **Full Line** — receives the entire remaining quantity, no confirmation.
   - **Partial Line** — modal to choose a quantity (defaults to, capped at,
@@ -36,10 +41,11 @@ A desktop MAWM app for a warehouse dock worker to receive against an ASN.
 detail):
 - No handling yet for MAWM rejecting/warning when a receive quantity
   exceeds an item's max LPN quantity.
-- A receive write and the very next ASN read can lag by roughly one
-  receive's worth of quantity (eventual consistency) — low risk today since
-  the busy overlay blocks rapid double-clicks on the same line, but not
-  formally mitigated (no poll-until-visible/retry-with-reverify).
+- Possible eventual-consistency lag between a receive write and the very
+  next read — not re-verified against the current (corrected)
+  dcinventory-based received-quantity source, not formally mitigated
+  (no poll-until-visible/retry-with-reverify). Low risk today since the
+  busy overlay blocks rapid double-clicks on the same line.
 
 ## Running locally
 

@@ -14,6 +14,7 @@ from mawm_client import (
     resolve_location,
     search_asn,
     search_asns,
+    search_inventory_onhand_by_container,
     search_items,
 )
 
@@ -131,32 +132,50 @@ def _asn_line_id(line: dict) -> str:
     return ""
 
 
-def _received_qty_by_asn_line(asn: dict) -> Dict[str, Decimal]:
+def _received_qty_by_asn_line(
+    asn: dict, token: str, org: str, location: str = None
+) -> Dict[str, Decimal]:
     """Sum quantity already received into LPNs, keyed by AsnLineId.
 
-    MAWM's asn/search response doesn't expose a per-line "received" field
-    directly — it's derived from the nested Lpn[].LpnDetail[] rows.
+    MAWM's asn/search response doesn't expose a reliable per-line "received"
+    field directly. Two things were tried and rejected before this:
 
-    Verified directly against a live receive (lpn/receive) response: for an
-    LPN created by an actual receive transaction, LpnDetail.ShippedQuantity
-    is always 0 — the real received quantity (in base units) lands in
-    ReportingUomQuantity instead. (supplierenablement's own cartonization
-    flow, lpn/create, is a *different* MAWM transaction that populates
-    ShippedQuantity instead — this app never calls that endpoint, only
-    lpn/receive, so ReportingUomQuantity is the correct field here. Fall
-    back to ShippedQuantity per-row in case a cartonized-but-not-yet-received
-    LPN ever shows up on the same ASN.)
+    1. Lpn[].LpnDetail[].ShippedQuantity — always 0 for a receive-created
+       LPN (that's supplierenablement's *different* lpn/create flow).
+    2. Lpn[].LpnDetail[].ReportingUomQuantity — looked right for
+       single-unit receives, but confirmed wrong for a multi-unit one: a
+       single lpn/receive call with Quantity=2 left ReportingUomQuantity
+       at 1 on the resulting LpnDetail (verified: MAWM's own dmui-facade
+       ASN-line report showed the true total was 1 higher than summing
+       this field would give).
+
+    The AsnLineId link on Lpn[].LpnDetail[] *is* reliable, so this uses it
+    only to map each LPN to its line, then sums the real quantity from
+    dcinventory's Inventory object (OnHand) per LPN — confirmed to match
+    MAWM's own dmui-facade ASN-line report (ReceivedQuantity) exactly
+    across every UOM on the test ASN (UNIT, PACK, BUNDLE, LPN/Case,
+    PALLET).
     """
-    totals: Dict[str, Decimal] = {}
+    lpn_to_line: Dict[str, str] = {}
     for lpn in asn.get("Lpn") or []:
+        lpn_id = str(lpn.get("LpnId") or "").strip()
+        if not lpn_id:
+            continue
         for detail in lpn.get("LpnDetail") or []:
             asn_line_id = str(detail.get("AsnLineId") or "").strip()
-            if not asn_line_id:
-                continue
-            qty = _dec(detail.get("ReportingUomQuantity"))
-            if qty <= 0:
-                qty = _dec(detail.get("ShippedQuantity"))
-            totals[asn_line_id] = totals.get(asn_line_id, Decimal("0")) + qty
+            if asn_line_id:
+                lpn_to_line[lpn_id] = asn_line_id
+                break
+    if not lpn_to_line:
+        return {}
+
+    onhand_by_lpn = search_inventory_onhand_by_container(
+        list(lpn_to_line.keys()), token, org, location=location
+    )
+    totals: Dict[str, Decimal] = {}
+    for lpn_id, asn_line_id in lpn_to_line.items():
+        qty = onhand_by_lpn.get(lpn_id, Decimal("0"))
+        totals[asn_line_id] = totals.get(asn_line_id, Decimal("0")) + qty
     return totals
 
 
@@ -179,7 +198,7 @@ def load_asn_for_receiving(
 
     item_ids = [str(l.get("ItemId") or "") for l in raw_lines if l.get("ItemId")]
     items = search_items(item_ids, token, org, location=dest) if item_ids else {}
-    received_by_line = _received_qty_by_asn_line(asn)
+    received_by_line = _received_qty_by_asn_line(asn, token, org, location=dest)
 
     lines: List[dict] = []
     for idx, line in enumerate(raw_lines, start=1):
@@ -248,16 +267,19 @@ def _line_state_for_receipt(
     avoids acting on stale data — another receive could have happened since
     the table was last loaded.
 
-    KNOWN GAP, observed directly while testing: a search immediately after a
-    successful lpn/receive write can still lag behind it by roughly one
-    receive's worth of quantity (an eventual-consistency read lag, not a
-    write failure — the two manual test receives here both returned
-    success and the totals were correct a few seconds later). This means
-    two receive calls against the *same* line placed back-to-back, faster
-    than that lag resolves, could compute "remaining" from a stale read —
-    under-stating it (risking an over-receive) or over-stating it. Not
-    mitigated yet (no poll-until-visible/retry-with-reverify added). Low
-    risk today since the busy-overlay blocks a rapid double-click on the
+    POSSIBLE GAP, not confirmed against this corrected read path: an
+    earlier test against the previous (since-replaced) received-quantity
+    source suggested a read immediately after a write could lag by about
+    one receive's worth — but that source was later found to be wrong in
+    a way that fully explains what looked like lag (see
+    _received_qty_by_asn_line's docstring), so it's unclear how much of
+    that observation was real eventual consistency vs. just the bug. Not
+    re-verified against dcinventory's Inventory search specifically. If
+    two receive calls land on the *same* line back-to-back faster than
+    any real lag resolves, "remaining" could still be computed from a
+    stale read. Not mitigated (no poll-until-visible/retry-with-reverify
+    added). Low risk today since the busy-overlay blocks a rapid
+    double-click on the
     same line, but worth a real test (mirroring supplierenablement's
     poll-until-visible pattern, mawm_api_library/patterns/technical/
     paginated-fetch-all.md's related note, or dispatch_request's
@@ -280,7 +302,9 @@ def _line_state_for_receipt(
     item = items.get(item_id) or {}
 
     shipped_base = _dec(line.get("ShippedQuantity"))
-    received_base = _received_qty_by_asn_line(asn).get(asn_line_id, Decimal("0"))
+    received_base = _received_qty_by_asn_line(asn, token, org, location=dest).get(
+        asn_line_id, Decimal("0")
+    )
     remaining_base = shipped_base - received_base
     factor, display_uom = _package_conversion_factor(item, line.get("QuantityUomId"))
 
