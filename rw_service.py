@@ -19,6 +19,7 @@ from mawm_client import (
     search_ilpn_locations_by_asn,
     search_inventory_by_container_item,
     search_items,
+    search_receiving_transactions,
     search_staging_locations,
 )
 
@@ -92,6 +93,38 @@ def preload_staging_locations(
     # The MAWM query itself sorts by LocationId (asked for explicitly); the
     # picker should read by DisplayLocation instead, so re-sort here.
     entries.sort(key=lambda e: e["displayLocation"].lower())
+    return {
+        "success": True,
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
+def preload_transactions(
+    token: str,
+    org: str,
+    location: str = None,
+) -> Dict[str, Any]:
+    """All receiving TransactionIds for this org, for the Transaction ID picker.
+
+    Each entry carries its own strategyId — ReceivingStrategy is no longer
+    a separately hardcoded value, it's whatever's paired with the picked
+    TransactionId here.
+    """
+    dest = resolve_location(org, location)
+    rows = search_receiving_transactions(token, org, location=dest)
+    entries = []
+    for row in rows:
+        transaction_id = str(row.get("TransactionId") or "").strip()
+        if not transaction_id:
+            continue
+        entries.append(
+            {
+                "transactionId": transaction_id,
+                "strategyId": str(row.get("StrategyId") or "").strip(),
+                "description": str(row.get("Description") or "").strip(),
+            }
+        )
     return {
         "success": True,
         "count": len(entries),
@@ -451,6 +484,8 @@ def receive_line(
     asn_id: str,
     asn_line_id: str,
     mode: str,
+    transaction_id: str,
+    receiving_strategy: str,
     quantity_display: Optional[float] = None,
     location: str = None,
     staging_location_id: str = None,
@@ -463,7 +498,14 @@ def receive_line(
     not exceed what's remaining. `staging_location_id` is optional — the
     frontend only passes one once it's resolved a typed/picked value
     against the preloaded STAGING location list, so it's trusted here.
+    `transaction_id`/`receiving_strategy` are required — the frontend's
+    Transaction ID picker is a required field (disables Full/Partial/All
+    Lines until one's chosen), so a blank here means the frontend didn't
+    enforce that; fail rather than silently falling back to a default.
     """
+    if not transaction_id or not receiving_strategy:
+        return {"success": False, "error": "Transaction ID is required"}
+
     state = _line_state_for_receipt(token, org, asn_id, asn_line_id, location=location)
     if not state.get("success"):
         return state
@@ -502,6 +544,8 @@ def receive_line(
         token,
         org,
         location=state["dest"],
+        transaction_id=transaction_id,
+        receiving_strategy=receiving_strategy,
         staging_location_id=staging_location_id or None,
     )
     ok = result.get("success", True) if isinstance(result, dict) else True

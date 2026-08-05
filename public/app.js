@@ -10,9 +10,16 @@
     stagingLocations: [], // [{locationId, displayLocation}]
     stagingLocationId: "", // resolved LocationId, "" if none/invalid
     stagingLocationValid: true, // blank counts as valid (optional field)
+    transactions: [], // [{transactionId, strategyId, description}]
+    selectedTransactionId: "",
+    selectedStrategyId: "",
   };
 
   const STAGING_LOCATION_STORAGE_KEY = "rw_staging_location";
+  const TRANSACTION_STORAGE_KEY = "rw_transaction_id";
+  // The value this app used to hardcode before the Transaction ID picker
+  // existed — still the default selection when an org's list contains it.
+  const DEFAULT_TRANSACTION_ID = "Receiving";
 
   const el = {
     filtersScreen: document.getElementById("filtersScreen"),
@@ -34,6 +41,8 @@
     partialLineBtn: document.getElementById("partialLineBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
+    transactionIdSelect: document.getElementById("transactionIdSelect"),
+    transactionIdHint: document.getElementById("transactionIdHint"),
     stagingLocationInput: document.getElementById("stagingLocationInput"),
     stagingLocationSearchBtn: document.getElementById("stagingLocationSearchBtn"),
     stagingLocationDropdown: document.getElementById("stagingLocationDropdown"),
@@ -54,7 +63,8 @@
   };
 
   /** Case-insensitive query params: org/organization, theme, asn/asnid/asn_id/asn-id,
-   *  staginglocation/staging_location/staging-location */
+   *  staginglocation/staging_location/staging-location,
+   *  transactionid/transaction_id/transaction-id */
   function parseUrlParams() {
     const params = new URLSearchParams(window.location.search);
     const ci = {};
@@ -67,6 +77,9 @@
       asn: String(ci.asn || ci.asnid || ci.asn_id || ci["asn-id"] || "").trim(),
       stagingLocation: String(
         ci.staginglocation || ci.staging_location || ci["staging-location"] || ""
+      ).trim(),
+      transactionId: String(
+        ci.transactionid || ci.transaction_id || ci["transaction-id"] || ""
       ).trim(),
     };
   }
@@ -162,6 +175,7 @@
             : "";
       setStatus("Authenticated " + via + ". Preloading ASNs…", "success");
       await preload();
+      await preloadTransactions();
       await preloadStagingLocations();
       await applyUrlAsnBoot();
       return true;
@@ -261,6 +275,66 @@
       .join("");
   }
 
+  // --- Transaction ID ---
+
+  function populateTransactionSelect() {
+    const options = ['<option value="">-- Select --</option>'].concat(
+      state.transactions.map(
+        (t) => `<option value="${escapeAttr(t.transactionId)}">${escapeHtml(t.transactionId)}</option>`
+      )
+    );
+    el.transactionIdSelect.innerHTML = options.join("");
+  }
+
+  function evaluateTransactionSelection() {
+    const value = el.transactionIdSelect.value;
+    const match = state.transactions.find((t) => t.transactionId === value);
+    state.selectedTransactionId = match ? match.transactionId : "";
+    state.selectedStrategyId = match ? match.strategyId : "";
+    const valid = !!match;
+    el.transactionIdSelect.classList.toggle("invalid", !valid);
+    el.transactionIdHint.textContent = valid ? "" : "Required.";
+    if (valid) {
+      localStorage.setItem(TRANSACTION_STORAGE_KEY, match.transactionId);
+    }
+    updateLineActionButtons();
+  }
+
+  async function preloadTransactions() {
+    try {
+      const data = await api("preload_transactions", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+      });
+      if (data.success) {
+        state.transactions = data.entries || [];
+      }
+    } catch (e) {
+      // Non-fatal here — evaluateTransactionSelection() will still correctly
+      // leave the field blank/required if nothing loaded.
+    }
+    populateTransactionSelect();
+    applyTransactionIdBoot();
+  }
+
+  function applyTransactionIdBoot() {
+    const known = new Set(state.transactions.map((t) => t.transactionId));
+    let value = "";
+    if (urlParams.transactionId && known.has(urlParams.transactionId)) {
+      value = urlParams.transactionId;
+    } else {
+      const saved = localStorage.getItem(TRANSACTION_STORAGE_KEY);
+      if (saved && known.has(saved)) {
+        value = saved;
+      } else if (known.has(DEFAULT_TRANSACTION_ID)) {
+        value = DEFAULT_TRANSACTION_ID;
+      }
+    }
+    el.transactionIdSelect.value = value;
+    evaluateTransactionSelection();
+  }
+
   // --- Staging location ---
 
   function resolveStagingLocationText(text) {
@@ -358,9 +432,10 @@
   function updateLineActionButtons() {
     const hasSelection = state.selectedLineNumber !== null;
     const stagingOk = state.stagingLocationValid;
-    el.partialLineBtn.disabled = !hasSelection || !stagingOk;
-    el.fullLineBtn.disabled = !hasSelection || !stagingOk;
-    el.allLinesBtn.disabled = !stagingOk;
+    const transactionOk = !!state.selectedTransactionId;
+    el.partialLineBtn.disabled = !hasSelection || !stagingOk || !transactionOk;
+    el.fullLineBtn.disabled = !hasSelection || !stagingOk || !transactionOk;
+    el.allLinesBtn.disabled = !stagingOk || !transactionOk;
   }
 
   function selectLine(lineNumber) {
@@ -453,6 +528,8 @@
       mode,
       quantity,
       stagingLocationId: state.stagingLocationId || "",
+      transactionId: state.selectedTransactionId || "",
+      receivingStrategy: state.selectedStrategyId || "",
     });
   }
 
@@ -624,6 +701,8 @@
   el.partialLineConfirmBtn.addEventListener("click", confirmPartialLine);
   el.allLinesBtn.addEventListener("click", openAllLinesModal);
   el.allLinesConfirmBtn.addEventListener("click", confirmAllLines);
+
+  el.transactionIdSelect.addEventListener("change", evaluateTransactionSelection);
 
   el.stagingLocationInput.addEventListener("input", () => {
     evaluateStagingLocation();

@@ -17,6 +17,7 @@ from rw_service import (  # noqa: E402
     load_asn_for_receiving,
     preload_asn_index,
     preload_staging_locations,
+    preload_transactions,
     receive_line,
 )
 
@@ -25,7 +26,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "receivingworkbench-app"
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 
@@ -132,6 +133,21 @@ def preload_staging_locations_route():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/preload_transactions", methods=["POST"])
+def preload_transactions_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    try:
+        result = preload_transactions(token, org, location=location)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[PRELOAD_TRANSACTIONS] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/load_asn", methods=["POST"])
 def load_asn():
     data = _json()
@@ -160,8 +176,12 @@ def receive_line_route():
     mode = (data.get("mode") or "").strip().lower()
     quantity = data.get("quantity")
     staging_location_id = (data.get("stagingLocationId") or data.get("staging_location_id") or "").strip()
+    transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
+    receiving_strategy = (data.get("receivingStrategy") or data.get("receiving_strategy") or "").strip()
     if not asn_id or not asn_line_id:
         return jsonify({"success": False, "error": "asnId and asnLineId required"})
+    if not transaction_id or not receiving_strategy:
+        return jsonify({"success": False, "error": "Transaction ID is required"})
     try:
         result = receive_line(
             token,
@@ -169,6 +189,8 @@ def receive_line_route():
             asn_id,
             asn_line_id,
             mode,
+            transaction_id,
+            receiving_strategy,
             quantity_display=quantity,
             location=location,
             staging_location_id=staging_location_id or None,

@@ -30,8 +30,23 @@ A desktop MAWM app for a warehouse dock worker to receive against an ASN.
     the remaining quantity).
   - **All Lines** — confirms, then receives the full remaining quantity of
     every outstanding line, one `lpn/receive` call per line.
-- `TransactionId`/`ReceivingStrategy` are hardcoded (`"Receiving"` /
-  `"Receiving Strategy"`) — a dropdown to choose these is planned, not built.
+- **Transaction ID** dropdown, above Staging Location: populated from
+  `receiving/api/task/transaction/search`, sorted by `TransactionId`.
+  Required — Partial/Full/All Lines stay disabled until one's picked.
+  Defaults to `"Receiving"` if the org's list contains it, else blank;
+  persists to `localStorage`; `transactionid`/`transaction_id`/
+  `transaction-id` URL param pre-fills it. `ReceivingStrategy` is no
+  longer a separate hardcoded value — each TransactionId row carries its
+  own `StrategyId`, sent alongside it automatically.
+  **Not every TransactionId the picker offers will actually succeed** —
+  confirmed directly: `"Receive Item Level"` failed with a MAWM
+  ReceivingCriteria lookup error, and `"Receive By ASN"` failed because
+  this ASN has no In-Transit LPNs (it's ITEM-level, not LPN-level). Only
+  `"Receiving"` is confirmed compatible with this app's plain
+  `lpn/receive` payload shape on an ITEM-level ASN; the picker doesn't
+  filter the list down to "known good" ones, since there's no reliable
+  way to predict that in advance — a bad choice surfaces as a normal
+  error message, same as any other receive failure.
 - URL boot params (mirrors `supplierenablement`/`vasexecution`, case-insensitive):
   `org`/`organization` auto-authenticates; `asn`/`asnid`/`asn_id`/`asn-id`
   deep-links straight to a loaded ASN once auth completes; `theme=<key>`

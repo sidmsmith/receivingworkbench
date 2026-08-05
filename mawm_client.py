@@ -23,6 +23,7 @@ INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
 ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
 CONTAINER_CONDITION_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/containerCondition/search"
 LOCATION_QUICKSEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/location/quickSearch"
+TRANSACTION_SEARCH_URL = f"{HOST}/receiving/api/task/transaction/search"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -347,8 +348,12 @@ def receive_lpn(
     1 pack. rw_service.receive_line() converts the display-UOM quantity the
     user enters into base units before calling this.
 
-    TransactionId/ReceivingStrategy are hardcoded per current product scope;
-    a dropdown to choose these is planned but not yet built.
+    transaction_id/receiving_strategy come from the user's Transaction ID
+    picker (search_receiving_transactions) — each TransactionId there
+    carries its own paired StrategyId, so receiving_strategy is derived
+    from whichever TransactionId was picked, not chosen independently.
+    The defaults here ("Receiving" / "Receiving Strategy") only apply if
+    a caller doesn't supply them.
 
     TODO(testing): for a large Quantity, MAWM may reject/warn if it exceeds
     the item's max LPN quantity (item master). Not handled yet — needs a
@@ -516,5 +521,30 @@ def search_staging_locations(token: str, org: str, location: str = None) -> List
     if response.status_code != 200:
         raise RuntimeError(
             f"location quickSearch failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
+
+
+def search_receiving_transactions(token: str, org: str, location: str = None) -> List[dict]:
+    """All receiving TransactionIds for this org, for the Transaction ID picker.
+
+    Each row also carries its own StrategyId (e.g. "Receiving" pairs with
+    "Receiving Strategy") — that's the ReceivingStrategy to send alongside
+    whichever TransactionId is picked, not a separately hardcoded value.
+    """
+    token = normalize_token(token)
+    payload = {
+        "Query": "",
+        "Size": 1000,
+        "Sort": {"attribute": "TransactionId", "direction": "asc"},
+    }
+    response = _post(
+        TRANSACTION_SEARCH_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json=payload,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"transaction search failed: {response.status_code} {response.text[:500]}"
         )
     return _response_data_list(response.json())
