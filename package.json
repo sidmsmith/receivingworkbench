@@ -1,0 +1,17 @@
+{
+  "name": "receivingworkbench",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "node server.js"
+  },
+  "description": "Receiving Workbench - Dock receiving against an ASN",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-fetch": "^2.7.0"
+  },
+  "license": "ISC",
+  "type": "commonjs"
+}
