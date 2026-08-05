@@ -13,14 +13,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mawm_client import get_manhattan_token, normalize_token, validate_org  # noqa: E402
-from rw_service import load_asn_for_receiving, preload_asn_index  # noqa: E402
+from rw_service import load_asn_for_receiving, preload_asn_index, receive_line  # noqa: E402
 
 app = Flask(__name__)
 
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "receivingworkbench-app"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 
@@ -125,6 +125,35 @@ def load_asn():
         return jsonify(result)
     except Exception as e:
         print(f"[LOAD_ASN] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/receive_line", methods=["POST"])
+def receive_line_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    asn_id = (data.get("asnId") or data.get("asn_id") or "").strip()
+    asn_line_id = (data.get("asnLineId") or data.get("asn_line_id") or "").strip()
+    mode = (data.get("mode") or "").strip().lower()
+    quantity = data.get("quantity")
+    if not asn_id or not asn_line_id:
+        return jsonify({"success": False, "error": "asnId and asnLineId required"})
+    try:
+        result = receive_line(
+            token,
+            org,
+            asn_id,
+            asn_line_id,
+            mode,
+            quantity_display=quantity,
+            location=location,
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"[RECEIVE_LINE] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

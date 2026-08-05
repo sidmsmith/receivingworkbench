@@ -27,11 +27,35 @@
     partialLineBtn: document.getElementById("partialLineBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
+    actionStatus: document.getElementById("actionStatus"),
+    partialLineInfo: document.getElementById("partialLineInfo"),
+    partialQtyInput: document.getElementById("partialQtyInput"),
+    partialQtyUom: document.getElementById("partialQtyUom"),
+    partialQtyHint: document.getElementById("partialQtyHint"),
+    partialLineConfirmBtn: document.getElementById("partialLineConfirmBtn"),
+    allLinesList: document.getElementById("allLinesList"),
+    allLinesConfirmBtn: document.getElementById("allLinesConfirmBtn"),
     busyOverlay: document.getElementById("busyOverlay"),
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
     themeList: document.getElementById("themeList"),
   };
+
+  /** Case-insensitive query params: org/organization, theme, asn/asnid/asn_id/asn-id */
+  function parseUrlParams() {
+    const params = new URLSearchParams(window.location.search);
+    const ci = {};
+    for (const [key, value] of params.entries()) {
+      ci[String(key).toLowerCase()] = value;
+    }
+    return {
+      org: String(ci.org || ci.organization || "").trim(),
+      theme: String(ci.theme || "").trim(),
+      asn: String(ci.asn || ci.asnid || ci.asn_id || ci["asn-id"] || "").trim(),
+    };
+  }
+
+  const urlParams = parseUrlParams();
 
   function setBusy(on, label) {
     el.busyOverlay.classList.toggle("visible", !!on);
@@ -41,6 +65,11 @@
   function setStatus(msg, kind) {
     el.status.textContent = msg || "";
     el.status.className = "status-line flex-grow-1" + (kind ? " " + kind : "");
+  }
+
+  function setActionStatus(msg, kind) {
+    el.actionStatus.textContent = msg || "";
+    el.actionStatus.className = "status-line mb-2" + (kind ? " " + kind : "");
   }
 
   async function api(action, data) {
@@ -123,6 +152,7 @@
             : "";
       setStatus("Authenticated " + via + ". Preloading ASNs…", "success");
       await preload();
+      await applyUrlAsnBoot();
       return true;
     } catch (e) {
       setStatus(e.message || String(e), "error");
@@ -181,6 +211,7 @@
   function renderLines(lines) {
     state.selectedLineNumber = null;
     updateLineActionButtons();
+    setActionStatus("");
     el.linesBody.innerHTML = (lines || [])
       .map(
         (line) => `
@@ -228,34 +259,208 @@
     el.asnScan.focus();
   }
 
+  async function fetchAndRenderAsn(asnId) {
+    const data = await api("load_asn", {
+      org: state.org,
+      token: state.token,
+      location: state.facility,
+      asnId,
+    });
+    if (!data.success) {
+      setStatus(data.error || "Load failed", "error");
+      return false;
+    }
+    state.asn = data;
+    renderLines(data.lines);
+    el.asnMeta.innerHTML = `
+      <span><strong>ASN</strong> ${escapeHtml(data.asnId)}</span>
+      <span><strong>Status</strong> ${escapeHtml(data.asnStatusLabel || data.asnStatus)}</span>
+      <span><strong>Vendor</strong> ${escapeHtml(data.vendorId || "")}</span>
+    `;
+    el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
+    return true;
+  }
+
   async function loadAsn() {
     const asnId = el.asnScan.value.trim();
     if (!asnId || !state.validAsnIds.has(asnId)) return;
     setBusy(true, "Loading ASN…");
     try {
-      const data = await api("load_asn", {
-        org: state.org,
-        token: state.token,
-        location: state.facility,
-        asnId,
-      });
-      if (!data.success) {
-        setStatus(data.error || "Load failed", "error");
-        return;
-      }
-      state.asn = data;
-      renderLines(data.lines);
-      el.asnMeta.innerHTML = `
-        <span><strong>ASN</strong> ${escapeHtml(data.asnId)}</span>
-        <span><strong>Status</strong> ${escapeHtml(data.asnStatusLabel || data.asnStatus)}</span>
-        <span><strong>Vendor</strong> ${escapeHtml(data.vendorId || "")}</span>
-      `;
-      el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
-      showResults();
+      const ok = await fetchAndRenderAsn(asnId);
+      if (ok) showResults();
     } catch (e) {
       setStatus(e.message || String(e), "error");
     } finally {
       setBusy(false);
+    }
+  }
+
+  let urlAsnBootApplied = false;
+  async function applyUrlAsnBoot() {
+    if (urlAsnBootApplied) return;
+    urlAsnBootApplied = true;
+    if (!urlParams.asn) return;
+    el.asnScan.value = urlParams.asn.toUpperCase();
+    updateLoadButton();
+    if (!el.loadAsnBtn.disabled) await loadAsn();
+  }
+
+  function getSelectedLine() {
+    if (state.selectedLineNumber === null || !state.asn) return null;
+    return (state.asn.lines || []).find(
+      (l) => String(l.lineNumber) === String(state.selectedLineNumber)
+    ) || null;
+  }
+
+  function remainingQty(line) {
+    const rem = Number(line.shippedQuantity || 0) - Number(line.receivedQuantity || 0);
+    return rem > 0 ? rem : 0;
+  }
+
+  async function callReceiveLine(asnLineId, mode, quantity) {
+    return api("receive_line", {
+      org: state.org,
+      token: state.token,
+      location: state.facility,
+      asnId: state.asn.asnId,
+      asnLineId,
+      mode,
+      quantity,
+    });
+  }
+
+  async function receiveFullLine() {
+    const line = getSelectedLine();
+    if (!line) return;
+    const remaining = remainingQty(line);
+    if (remaining <= 0) {
+      setActionStatus("Line " + line.lineNumber + " is already fully received.", "error");
+      return;
+    }
+    setBusy(true, "Receiving line " + line.lineNumber + "…");
+    try {
+      const result = await callReceiveLine(line.asnLineId, "full");
+      if (!result.success) {
+        setActionStatus(result.error || "Receive failed", "error");
+        return;
+      }
+      setActionStatus(
+        "Received " + result.quantityDisplay + " " + result.displayUom +
+          " on line " + line.lineNumber + " (LPN " + result.lpnId + ").",
+        "success"
+      );
+      await fetchAndRenderAsn(state.asn.asnId);
+    } catch (e) {
+      setActionStatus(e.message || String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function openPartialModal() {
+    const line = getSelectedLine();
+    if (!line) return;
+    const remaining = remainingQty(line);
+    if (remaining <= 0) {
+      setActionStatus("Line " + line.lineNumber + " is already fully received.", "error");
+      return;
+    }
+    el.partialLineInfo.innerHTML =
+      "<strong>Line " + escapeHtml(line.lineNumber) + "</strong> — " +
+      escapeHtml(line.itemId) + " " + escapeHtml(line.description) +
+      "<br/>Remaining: " + remaining + " " + escapeHtml(line.quantityUomId);
+    el.partialQtyInput.value = remaining;
+    el.partialQtyInput.max = remaining;
+    el.partialQtyInput.min = 0;
+    el.partialQtyUom.textContent = line.quantityUomId;
+    el.partialQtyHint.textContent = "";
+    partialLineModal.show();
+  }
+
+  async function confirmPartialLine() {
+    const line = getSelectedLine();
+    if (!line) {
+      partialLineModal.hide();
+      return;
+    }
+    const remaining = remainingQty(line);
+    const qty = Number(el.partialQtyInput.value);
+    if (!qty || qty <= 0) {
+      el.partialQtyHint.textContent = "Enter a quantity greater than 0.";
+      return;
+    }
+    if (qty > remaining) {
+      el.partialQtyHint.textContent = "Cannot exceed remaining quantity (" + remaining + ").";
+      return;
+    }
+    partialLineModal.hide();
+    setBusy(true, "Receiving line " + line.lineNumber + "…");
+    try {
+      const result = await callReceiveLine(line.asnLineId, "partial", qty);
+      if (!result.success) {
+        setActionStatus(result.error || "Receive failed", "error");
+        return;
+      }
+      setActionStatus(
+        "Received " + result.quantityDisplay + " " + result.displayUom +
+          " on line " + line.lineNumber + " (LPN " + result.lpnId + ").",
+        "success"
+      );
+      await fetchAndRenderAsn(state.asn.asnId);
+    } catch (e) {
+      setActionStatus(e.message || String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  let allLinesPending = [];
+
+  function openAllLinesModal() {
+    if (!state.asn) return;
+    allLinesPending = (state.asn.lines || []).filter((l) => remainingQty(l) > 0);
+    if (!allLinesPending.length) {
+      setActionStatus("No outstanding lines to receive.", "");
+      return;
+    }
+    el.allLinesList.innerHTML = allLinesPending
+      .map(
+        (l) =>
+          "<li>Line " + escapeHtml(l.lineNumber) + " — " + escapeHtml(l.itemId) + " " +
+          escapeHtml(l.description) + ": " + remainingQty(l) + " " + escapeHtml(l.quantityUomId) + "</li>"
+      )
+      .join("");
+    allLinesModal.show();
+  }
+
+  async function confirmAllLines() {
+    allLinesModal.hide();
+    const total = allLinesPending.length;
+    let succeeded = 0;
+    const failures = [];
+    for (let i = 0; i < total; i++) {
+      const line = allLinesPending[i];
+      setBusy(true, "Receiving line " + (i + 1) + " of " + total + "…");
+      try {
+        const result = await callReceiveLine(line.asnLineId, "full");
+        if (result.success) {
+          succeeded++;
+        } else {
+          failures.push("Line " + line.lineNumber + ": " + (result.error || "failed"));
+        }
+      } catch (e) {
+        failures.push("Line " + line.lineNumber + ": " + (e.message || String(e)));
+      }
+    }
+    setBusy(false);
+    await fetchAndRenderAsn(state.asn.asnId);
+    if (!failures.length) {
+      setActionStatus("Received " + fmtCount(succeeded, "line") + ".", "success");
+    } else {
+      setActionStatus(
+        "Received " + succeeded + " of " + total + " lines. Failures: " + failures.join("; "),
+        "error"
+      );
     }
   }
 
@@ -280,7 +485,32 @@
 
   bindItemImagePreview(el.linesBody);
 
+  const partialLineModal = window.bootstrap
+    ? new window.bootstrap.Modal(document.getElementById("partialLineModal"))
+    : null;
+  const allLinesModal = window.bootstrap
+    ? new window.bootstrap.Modal(document.getElementById("allLinesModal"))
+    : null;
+
+  el.fullLineBtn.addEventListener("click", receiveFullLine);
+  el.partialLineBtn.addEventListener("click", openPartialModal);
+  el.partialLineConfirmBtn.addEventListener("click", confirmPartialLine);
+  el.allLinesBtn.addEventListener("click", openAllLinesModal);
+  el.allLinesConfirmBtn.addEventListener("click", confirmAllLines);
+
   if (window.InspectionThemes) {
+    // Theme=N hides the picker; Theme=<key> (case-insensitive) pre-selects a theme.
+    if (urlParams.theme && urlParams.theme.toUpperCase() === "N") {
+      el.themeSelectorBtn.style.display = "none";
+    } else if (urlParams.theme) {
+      const themes = window.InspectionThemes.themes;
+      const themeKey = themes[urlParams.theme]
+        ? urlParams.theme
+        : themes[urlParams.theme.toLowerCase()]
+          ? urlParams.theme.toLowerCase()
+          : null;
+      if (themeKey) localStorage.setItem("selectedTheme", themeKey);
+    }
     const themeModalEl = document.getElementById("themeModal");
     const themeModal = window.bootstrap ? new window.bootstrap.Modal(themeModalEl) : null;
     window.InspectionThemes.wireThemePicker({
@@ -291,5 +521,12 @@
     });
   }
 
-  el.org.focus();
+  // URL boot: Organization/org auto-authenticates (ASN deep-link is applied
+  // inside authenticate() once preload completes, see applyUrlAsnBoot()).
+  if (urlParams.org) {
+    el.org.value = urlParams.org.toUpperCase();
+    authenticate(urlParams.org);
+  } else {
+    el.org.focus();
+  }
 })();

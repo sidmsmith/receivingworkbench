@@ -17,6 +17,8 @@ AUTH_HOST = os.getenv("MANHATTAN_AUTH_HOST", "salep-auth.sce.manh.com")
 
 ASN_SEARCH_URL = f"{HOST}/receiving/api/receiving/asn/search"
 ITEM_SEARCH_URL = f"{HOST}/item-master/api/item-master/item/search"
+LPN_RECEIVE_URL = f"{HOST}/receiving/api/receiving/lpn/receive"
+ILPN_GENERATE_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/generateIlpnIds"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -269,3 +271,85 @@ def search_items(
         return {}
     data = _response_data_list(response.json())
     return {str(item.get("ItemId")): item for item in data if item.get("ItemId")}
+
+
+def qty_for_payload(value) -> "int | float":
+    dec = Decimal(str(value))
+    if dec == dec.to_integral_value():
+        return int(dec)
+    return float(dec)
+
+
+def generate_ilpn_ids(
+    count: int, token: str, org: str, location: str = None
+) -> List[str]:
+    """Reserve `count` new iLPN numbers via dcinventory/ilpn/generateIlpnIds."""
+    token = normalize_token(token)
+    response = _post(
+        ILPN_GENERATE_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json={"numberOfILpns": max(1, int(count))},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"generateIlpnIds failed ({response.status_code}): {response.text[:500]}"
+        )
+    body = response.json() if response.text else {}
+    data = body.get("data") if isinstance(body, dict) else body
+    ids = [str(v).strip() for v in (data or []) if str(v or "").strip()]
+    if not ids:
+        raise RuntimeError(f"generateIlpnIds returned no ids. Response: {response.text[:500]}")
+    return ids
+
+
+def receive_lpn(
+    asn_id: str,
+    lpn_id: str,
+    line_items: List[dict],
+    token: str,
+    org: str,
+    location: str = None,
+    transaction_id: str = "Receiving",
+    receiving_strategy: str = "Receiving Strategy",
+) -> dict:
+    """POST receiving/lpn/receive — books received quantity against a new LPN.
+
+    `line_items` is [{"ItemId": ..., "Quantity": ...}, ...]; Quantity is in
+    the item's BASE unit (matching AsnLine.ShippedQuantity), not the item's
+    display/pack UOM — confirmed directly: a live Quantity=1 receive against
+    a PACK-uom item (10 base units per pack) produced OnHand=1 (one base
+    unit) and the ASN line's received quantity read back as 0.1 packs, not
+    1 pack. rw_service.receive_line() converts the display-UOM quantity the
+    user enters into base units before calling this.
+
+    TransactionId/ReceivingStrategy are hardcoded per current product scope;
+    a dropdown to choose these is planned but not yet built.
+
+    TODO(testing): for a large Quantity, MAWM may reject/warn if it exceeds
+    the item's max LPN quantity (item master). Not handled yet — needs a
+    real test against an item with a MaxLpnQuantity set.
+    """
+    token = normalize_token(token)
+    payload = {
+        "AsnId": asn_id,
+        "LpnId": lpn_id,
+        "TransactionId": transaction_id,
+        "ReceivingStrategy": receiving_strategy,
+        "UserInputLineItemList": line_items,
+    }
+    response = _post(
+        LPN_RECEIVE_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"lpn/receive failed: {response.status_code} {response.text[:800]}"
+        )
+    if isinstance(body, dict):
+        body["_requestPayload"] = payload
+    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}

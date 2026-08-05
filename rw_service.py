@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional
 
 from mawm_client import (
     asn_status_description,
+    generate_ilpn_ids,
+    qty_for_payload,
+    receive_lpn,
     resolve_location,
     search_asn,
     search_asns,
@@ -98,9 +101,17 @@ def _received_qty_by_asn_line(asn: dict) -> Dict[str, Decimal]:
     """Sum quantity already received into LPNs, keyed by AsnLineId.
 
     MAWM's asn/search response doesn't expose a per-line "received" field
-    directly — it's derived from the nested Lpn[].LpnDetail[] rows, each of
-    which records the AsnLineId + ShippedQuantity it consumed (same
-    derivation supplierenablement uses for "already cartonized" quantity).
+    directly — it's derived from the nested Lpn[].LpnDetail[] rows.
+
+    Verified directly against a live receive (lpn/receive) response: for an
+    LPN created by an actual receive transaction, LpnDetail.ShippedQuantity
+    is always 0 — the real received quantity (in base units) lands in
+    ReportingUomQuantity instead. (supplierenablement's own cartonization
+    flow, lpn/create, is a *different* MAWM transaction that populates
+    ShippedQuantity instead — this app never calls that endpoint, only
+    lpn/receive, so ReportingUomQuantity is the correct field here. Fall
+    back to ShippedQuantity per-row in case a cartonized-but-not-yet-received
+    LPN ever shows up on the same ASN.)
     """
     totals: Dict[str, Decimal] = {}
     for lpn in asn.get("Lpn") or []:
@@ -108,9 +119,10 @@ def _received_qty_by_asn_line(asn: dict) -> Dict[str, Decimal]:
             asn_line_id = str(detail.get("AsnLineId") or "").strip()
             if not asn_line_id:
                 continue
-            totals[asn_line_id] = totals.get(asn_line_id, Decimal("0")) + _dec(
-                detail.get("ShippedQuantity")
-            )
+            qty = _dec(detail.get("ReportingUomQuantity"))
+            if qty <= 0:
+                qty = _dec(detail.get("ShippedQuantity"))
+            totals[asn_line_id] = totals.get(asn_line_id, Decimal("0")) + qty
     return totals
 
 
@@ -175,4 +187,129 @@ def load_asn_for_receiving(
         "vendorId": asn.get("VendorId"),
         "lineCount": len(lines),
         "lines": lines,
+    }
+
+
+def _line_state_for_receipt(
+    token: str, org: str, asn_id: str, asn_line_id: str, location: str = None
+) -> Dict[str, Any]:
+    """Re-fetch the ASN fresh and resolve one line's authoritative base-unit state.
+
+    Re-fetching (rather than trusting quantities the frontend already has)
+    avoids acting on stale data — another receive could have happened since
+    the table was last loaded.
+
+    KNOWN GAP, observed directly while testing: a search immediately after a
+    successful lpn/receive write can still lag behind it by roughly one
+    receive's worth of quantity (an eventual-consistency read lag, not a
+    write failure — the two manual test receives here both returned
+    success and the totals were correct a few seconds later). This means
+    two receive calls against the *same* line placed back-to-back, faster
+    than that lag resolves, could compute "remaining" from a stale read —
+    under-stating it (risking an over-receive) or over-stating it. Not
+    mitigated yet (no poll-until-visible/retry-with-reverify added). Low
+    risk today since the busy-overlay blocks a rapid double-click on the
+    same line, but worth a real test (mirroring supplierenablement's
+    poll-until-visible pattern, mawm_api_library/patterns/technical/
+    paginated-fetch-all.md's related note, or dispatch_request's
+    retry-fallback-verification pattern) before this sees real usage.
+    """
+    dest = resolve_location(org, location)
+    asn = search_asn(asn_id, token, org, location=dest)
+    if not asn:
+        return {"success": False, "error": f"ASN {asn_id} not found"}
+
+    raw_lines = asn.get("AsnLine") or []
+    line = next(
+        (l for l in raw_lines if _asn_line_id(l) == str(asn_line_id)), None
+    )
+    if not line:
+        return {"success": False, "error": f"ASN line {asn_line_id} not found on {asn_id}"}
+
+    item_id = str(line.get("ItemId") or "")
+    items = search_items([item_id], token, org, location=dest) if item_id else {}
+    item = items.get(item_id) or {}
+
+    shipped_base = _dec(line.get("ShippedQuantity"))
+    received_base = _received_qty_by_asn_line(asn).get(asn_line_id, Decimal("0"))
+    remaining_base = shipped_base - received_base
+    factor, display_uom = _package_conversion_factor(item, line.get("QuantityUomId"))
+
+    return {
+        "success": True,
+        "dest": dest,
+        "itemId": item_id,
+        "shippedBase": shipped_base,
+        "receivedBase": received_base,
+        "remainingBase": remaining_base,
+        "factor": factor,
+        "displayUom": display_uom,
+    }
+
+
+def receive_line(
+    token: str,
+    org: str,
+    asn_id: str,
+    asn_line_id: str,
+    mode: str,
+    quantity_display: Optional[float] = None,
+    location: str = None,
+) -> Dict[str, Any]:
+    """Receive against one ASN line — mode "full" or "partial".
+
+    "full" books the entire remaining quantity. "partial" books
+    `quantity_display` (in the item's display/pack UOM, same units the
+    table shows) after converting to base units and validating it does
+    not exceed what's remaining.
+    """
+    state = _line_state_for_receipt(token, org, asn_id, asn_line_id, location=location)
+    if not state.get("success"):
+        return state
+
+    remaining_base = state["remainingBase"]
+    factor = state["factor"]
+    if remaining_base <= 0:
+        return {"success": False, "error": "No remaining quantity on this line"}
+
+    if mode == "full":
+        qty_base = remaining_base
+    elif mode == "partial":
+        if quantity_display is None:
+            return {"success": False, "error": "quantity is required for a partial receipt"}
+        qty_display = _dec(quantity_display)
+        if qty_display <= 0:
+            return {"success": False, "error": "quantity must be greater than 0"}
+        qty_base = qty_display * factor
+        if qty_base > remaining_base:
+            return {
+                "success": False,
+                "error": f"quantity exceeds remaining ({_num(remaining_base / factor)} {state['displayUom']})",
+            }
+    else:
+        return {"success": False, "error": f"Unknown mode: {mode}"}
+
+    lpn_ids = generate_ilpn_ids(1, token, org, location=state["dest"])
+    lpn_id = lpn_ids[0]
+
+    # TODO(testing): large qty_base may trip the item's MaxLpnQuantity on
+    # MAWM's side (warning or error) — not handled yet, see receive_lpn().
+    result = receive_lpn(
+        asn_id,
+        lpn_id,
+        [{"ItemId": state["itemId"], "Quantity": qty_for_payload(qty_base)}],
+        token,
+        org,
+        location=state["dest"],
+    )
+    ok = result.get("success", True) if isinstance(result, dict) else True
+    return {
+        "success": bool(ok),
+        "lpnId": lpn_id,
+        "itemId": state["itemId"],
+        "quantityBase": _num(qty_base),
+        "quantityDisplay": _num(qty_base / factor),
+        "displayUom": state["displayUom"],
+        "mawmResponse": result,
+        "error": None if ok else (result.get("message") or result.get("error") or "Receive failed"),
     }
