@@ -20,6 +20,8 @@ ITEM_SEARCH_URL = f"{HOST}/item-master/api/item-master/item/search"
 LPN_RECEIVE_URL = f"{HOST}/receiving/api/receiving/lpn/receive"
 ILPN_GENERATE_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/generateIlpnIds"
 INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
+ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
+CONTAINER_CONDITION_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/containerCondition/search"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -41,6 +43,18 @@ ASN_STATUS_LABELS = {
 
 # Statuses eligible for receiving — confirmed with the user.
 RECEIVABLE_ASN_STATUSES = ("1000", "3000")
+
+# LpnStatus (receiving component, i.e. ASN's own nested Lpn[].LpnStatus) —
+# mawm_api_library/_conventions/statuses.md. Labels confirmed verbatim
+# against a live LPN Inquiry response's own LpnStatusDescription field
+# (e.g. "4000" -> "Received").
+LPN_STATUS_LABELS = {
+    "1000": "In Transit",
+    "3000": "In Receiving",
+    "4000": "Received",
+    "7000": "Not Received ASN Verified",
+    "9000": "Canceled",
+}
 
 
 def _get(url: str, **kwargs) -> requests.Response:
@@ -146,6 +160,14 @@ def asn_status_description(status_id) -> str:
         return ""
     key = str(status_id).strip()
     return ASN_STATUS_LABELS.get(key) or key
+
+
+def lpn_status_description(status_id) -> str:
+    """Human LPN status only, e.g. 'Received'."""
+    if status_id in (None, ""):
+        return ""
+    key = str(status_id).strip()
+    return LPN_STATUS_LABELS.get(key) or key
 
 
 def search_asns(
@@ -356,17 +378,18 @@ def receive_lpn(
     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
 
 
-def search_inventory_onhand_by_container(
+def search_inventory_by_container_item(
     container_ids: List[str], token: str, org: str, location: str = None
-) -> Dict[str, Decimal]:
-    """Sum OnHand per ILPN container id, via dcinventory's Inventory object.
+) -> Dict[str, Dict[str, Decimal]]:
+    """{LpnId: {ItemId: OnHand}} via dcinventory's Inventory object.
 
     This is the ground truth for received quantity — confirmed directly
     against a live receive: a single lpn/receive call with Quantity=2
     left the ASN's own Lpn[].LpnDetail[].ReportingUomQuantity at 1 (that
     field does not reliably reflect quantities above 1), while this same
     LPN's Inventory record correctly showed OnHand=2. Use this, not
-    LpnDetail, whenever the real received quantity matters.
+    LpnDetail, whenever the real received quantity matters. Broken out
+    per-item (not just summed per LPN) so a multi-item LPN can be detected.
     """
     clean = sorted({str(c).strip() for c in container_ids if str(c).strip()})
     if not clean:
@@ -387,11 +410,86 @@ def search_inventory_onhand_by_container(
         raise RuntimeError(
             f"inventory search failed: {response.status_code} {response.text[:500]}"
         )
-    out: Dict[str, Decimal] = {}
+    out: Dict[str, Dict[str, Decimal]] = {}
     for row in _response_data_list(response.json()):
         cid = str(row.get("InventoryContainerId") or "").strip()
-        if not cid:
+        item_id = str(row.get("ItemId") or "").strip()
+        if not cid or not item_id:
             continue
         onhand = Decimal(str(row.get("OnHand") or 0))
-        out[cid] = out.get(cid, Decimal("0")) + onhand
+        bucket = out.setdefault(cid, {})
+        bucket[item_id] = bucket.get(item_id, Decimal("0")) + onhand
+    return out
+
+
+def search_ilpn_locations_by_asn(
+    asn_id: str, token: str, org: str, location: str = None
+) -> Dict[str, str]:
+    """{LpnId: CurrentLocationId} for every ILPN linked to this ASN.
+
+    Verified directly against a live "LPN Inquiry" response: this
+    matches its LocationId field exactly.
+    """
+    token = normalize_token(token)
+    payload = {
+        "Query": f"AsnId ='{asn_id}'",
+        "Size": 200,
+        "Page": 0,
+        "Template": {"IlpnId": "", "CurrentLocationId": ""},
+    }
+    response = _post(
+        ILPN_SEARCH_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json=payload,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"ilpn search failed: {response.status_code} {response.text[:500]}"
+        )
+    out: Dict[str, str] = {}
+    for row in _response_data_list(response.json()):
+        lpn_id = str(row.get("IlpnId") or "").strip()
+        if lpn_id:
+            out[lpn_id] = str(row.get("CurrentLocationId") or "").strip()
+    return out
+
+
+def search_container_conditions(
+    container_ids: List[str], token: str, org: str, location: str = None
+) -> Dict[str, List[str]]:
+    """{LpnId: [ConditionCode, ...]} via dcinventory's containerCondition object.
+
+    Not exposed on ilpn/search or inventory/search — this dedicated object
+    is the only place it was found to be queryable (confirmed directly:
+    it matched the ConditionCodes the lpn/receive response itself echoed
+    back at receive time).
+    """
+    clean = sorted({str(c).strip() for c in container_ids if str(c).strip()})
+    if not clean:
+        return {}
+    token = normalize_token(token)
+    quoted = ", ".join(f"'{c}'" for c in clean)
+    payload = {
+        "Query": f"InventoryContainerId in ({quoted})",
+        "Size": max(len(clean) * 3, 50),
+        "Page": 0,
+    }
+    response = _post(
+        CONTAINER_CONDITION_SEARCH_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json=payload,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"containerCondition search failed: {response.status_code} {response.text[:500]}"
+        )
+    out: Dict[str, List[str]] = {}
+    for row in _response_data_list(response.json()):
+        cid = str(row.get("InventoryContainerId") or "").strip()
+        code = str(row.get("ConditionCode") or "").strip()
+        if not cid or not code:
+            continue
+        bucket = out.setdefault(cid, [])
+        if code not in bucket:
+            bucket.append(code)
     return out

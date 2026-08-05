@@ -9,12 +9,15 @@ from typing import Any, Dict, List, Optional
 from mawm_client import (
     asn_status_description,
     generate_ilpn_ids,
+    lpn_status_description,
     qty_for_payload,
     receive_lpn,
     resolve_location,
     search_asn,
     search_asns,
-    search_inventory_onhand_by_container,
+    search_container_conditions,
+    search_ilpn_locations_by_asn,
+    search_inventory_by_container_item,
     search_items,
 )
 
@@ -169,14 +172,102 @@ def _received_qty_by_asn_line(
     if not lpn_to_line:
         return {}
 
-    onhand_by_lpn = search_inventory_onhand_by_container(
+    onhand_by_lpn = search_inventory_by_container_item(
         list(lpn_to_line.keys()), token, org, location=location
     )
     totals: Dict[str, Decimal] = {}
     for lpn_id, asn_line_id in lpn_to_line.items():
-        qty = onhand_by_lpn.get(lpn_id, Decimal("0"))
+        qty = sum(onhand_by_lpn.get(lpn_id, {}).values(), Decimal("0"))
         totals[asn_line_id] = totals.get(asn_line_id, Decimal("0")) + qty
     return totals
+
+
+def _build_lpn_summaries(
+    asn: dict, asn_id: str, items: Dict[str, dict], token: str, org: str, location: str
+) -> List[dict]:
+    """One row per LPN linked to this ASN, for the LPN panel.
+
+    Quantity comes from dcinventory's Inventory object (OnHand), same as
+    _received_qty_by_asn_line — LpnDetail's own quantity fields are not
+    reliable (see that function's docstring). Location and status come
+    from the ASN's own nested Lpn[] plus one AsnId-scoped ilpn/search
+    call; condition codes need a dedicated containerCondition/search
+    call, since neither ilpn/search nor inventory/search expose them.
+    """
+    lpn_status: Dict[str, str] = {}
+    lpn_item_ids: Dict[str, List[str]] = {}
+    for lpn in asn.get("Lpn") or []:
+        lpn_id = str(lpn.get("LpnId") or "").strip()
+        if not lpn_id:
+            continue
+        lpn_status[lpn_id] = str(lpn.get("LpnStatus") or "")
+        seen: List[str] = []
+        for detail in lpn.get("LpnDetail") or []:
+            item_id = str(detail.get("ItemId") or "").strip()
+            if item_id and item_id not in seen:
+                seen.append(item_id)
+        lpn_item_ids[lpn_id] = seen
+
+    lpn_ids = list(lpn_item_ids.keys())
+    if not lpn_ids:
+        return []
+
+    locations = search_ilpn_locations_by_asn(asn_id, token, org, location=location)
+    onhand = search_inventory_by_container_item(lpn_ids, token, org, location=location)
+    conditions = search_container_conditions(lpn_ids, token, org, location=location)
+
+    all_item_ids = {i for ids in lpn_item_ids.values() for i in ids}
+    missing_item_ids = all_item_ids - set(items.keys())
+    if missing_item_ids:
+        items = dict(items)
+        items.update(search_items(list(missing_item_ids), token, org, location=location))
+
+    item_quantity_uom: Dict[str, str] = {}
+    for line in asn.get("AsnLine") or []:
+        iid = str(line.get("ItemId") or "").strip()
+        if iid and iid not in item_quantity_uom:
+            item_quantity_uom[iid] = line.get("QuantityUomId")
+
+    summaries: List[dict] = []
+    for lpn_id in lpn_ids:
+        item_ids = lpn_item_ids.get(lpn_id) or []
+        item_onhand = onhand.get(lpn_id, {})
+        present_items = [i for i in item_ids if item_onhand.get(i, Decimal("0")) > 0] or item_ids
+        mixed = len(present_items) > 1
+
+        item_display = ""
+        description = ""
+        qty_display: Any = ""
+        uom_display = ""
+        if mixed:
+            item_display = "MIXED"
+        elif present_items:
+            item_id = present_items[0]
+            item = items.get(item_id) or {}
+            item_display = item_id
+            description = item.get("Description") or item.get("ItemDescription") or ""
+            base_qty = item_onhand.get(item_id, Decimal("0"))
+            factor, display_uom = _package_conversion_factor(
+                item, item_quantity_uom.get(item_id)
+            )
+            qty_display = _num(base_qty / factor)
+            uom_display = display_uom
+
+        summaries.append(
+            {
+                "lpnId": lpn_id,
+                "statusLabel": lpn_status_description(lpn_status.get(lpn_id)),
+                "location": locations.get(lpn_id) or "",
+                "itemId": item_display,
+                "description": description,
+                "qty": qty_display,
+                "uom": uom_display,
+                "conditionCode": ", ".join(conditions.get(lpn_id) or []),
+            }
+        )
+
+    summaries.sort(key=lambda r: r["lpnId"])
+    return summaries
 
 
 def load_asn_for_receiving(
@@ -246,6 +337,8 @@ def load_asn_for_receiving(
             }
         )
 
+    lpns = _build_lpn_summaries(asn, asn_id, items, token, org, dest)
+
     return {
         "success": True,
         "asnId": asn_id,
@@ -255,6 +348,8 @@ def load_asn_for_receiving(
         "vendorId": asn.get("VendorId"),
         "lineCount": len(lines),
         "lines": lines,
+        "lpnCount": len(lpns),
+        "lpns": lpns,
     }
 
 

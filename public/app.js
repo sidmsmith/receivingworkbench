@@ -24,6 +24,8 @@
     resultsStatus: document.getElementById("resultsStatus"),
     asnMeta: document.getElementById("asnMeta"),
     linesBody: document.getElementById("linesBody"),
+    lpnCount: document.getElementById("lpnCount"),
+    lpnBody: document.getElementById("lpnBody"),
     partialLineBtn: document.getElementById("partialLineBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
@@ -225,6 +227,25 @@
       .join("");
   }
 
+  function renderLpns(lpns) {
+    el.lpnCount.textContent = (lpns || []).length;
+    el.lpnBody.innerHTML = (lpns || [])
+      .map(
+        (lpn) => `
+        <tr>
+          <td>${escapeHtml(lpn.lpnId)}</td>
+          <td>${escapeHtml(lpn.statusLabel)}</td>
+          <td>${escapeHtml(lpn.location)}</td>
+          <td>${escapeHtml(lpn.itemId)}</td>
+          <td>${escapeHtml(lpn.description)}</td>
+          <td class="col-qty-wide">${escapeHtml(lpn.qty)}</td>
+          <td>${escapeHtml(lpn.uom)}</td>
+          <td>${escapeHtml(lpn.conditionCode)}</td>
+        </tr>`
+      )
+      .join("");
+  }
+
   function updateLineActionButtons() {
     const hasSelection = state.selectedLineNumber !== null;
     el.partialLineBtn.disabled = !hasSelection;
@@ -265,6 +286,7 @@
     }
     state.asn = data;
     renderLines(data.lines);
+    renderLpns(data.lpns);
     el.asnMeta.innerHTML = `
       <span><strong>ASN</strong> ${escapeHtml(data.asnId)}</span>
       <span><strong>Status</strong> ${escapeHtml(data.asnStatusLabel || data.asnStatus)}</span>

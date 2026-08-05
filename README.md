@@ -36,6 +36,15 @@ A desktop MAWM app for a warehouse dock worker to receive against an ASN.
   `org`/`organization` auto-authenticates; `asn`/`asnid`/`asn_id`/`asn-id`
   deep-links straight to a loaded ASN once auth completes; `theme=<key>`
   pre-selects a theme, `theme=N` hides the theme picker button.
+- Collapsed accordion below the lines table, "Received LPNs (N)", listing
+  every LPN linked to the ASN: LPN, Status (`Lpn[].LpnStatus`, e.g.
+  "Received"), Location (`CurrentLocationId` — blank until put away, since
+  this app's own receives don't pass one), Item ("MIXED" if the LPN holds
+  more than one), Description (blank if mixed), Qty + UOM (blank if mixed),
+  Condition Code (comma-separated if more than one). Condition codes
+  required their own endpoint — `dcinventory/containerCondition/search` —
+  since neither `ilpn/search` nor `inventory/search` expose them despite
+  `lpn/receive`'s own response echoing one back.
 
 **Known open items** (see comments in `rw_service.py`/`mawm_client.py` for
 detail):
