@@ -19,6 +19,7 @@ from mawm_client import (
     search_ilpn_locations_by_asn,
     search_inventory_by_container_item,
     search_items,
+    search_staging_locations,
 )
 
 
@@ -60,6 +61,32 @@ def preload_asn_index(
                 "statusLabel": asn_status_description(row.get("AsnStatus")),
                 "vendorId": str(row.get("VendorId") or ""),
                 "destinationFacilityId": str(row.get("DestinationFacilityId") or ""),
+            }
+        )
+    return {
+        "success": True,
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
+def preload_staging_locations(
+    token: str,
+    org: str,
+    location: str = None,
+) -> Dict[str, Any]:
+    """All active STAGING locations, for the staging-location picker."""
+    dest = resolve_location(org, location)
+    rows = search_staging_locations(token, org, location=dest)
+    entries = []
+    for row in rows:
+        location_id = str(row.get("LocationId") or "").strip()
+        if not location_id:
+            continue
+        entries.append(
+            {
+                "locationId": location_id,
+                "displayLocation": str(row.get("DisplayLocation") or "").strip() or location_id,
             }
         )
     return {
@@ -423,13 +450,16 @@ def receive_line(
     mode: str,
     quantity_display: Optional[float] = None,
     location: str = None,
+    staging_location_id: str = None,
 ) -> Dict[str, Any]:
     """Receive against one ASN line — mode "full" or "partial".
 
     "full" books the entire remaining quantity. "partial" books
     `quantity_display` (in the item's display/pack UOM, same units the
     table shows) after converting to base units and validating it does
-    not exceed what's remaining.
+    not exceed what's remaining. `staging_location_id` is optional — the
+    frontend only passes one once it's resolved a typed/picked value
+    against the preloaded STAGING location list, so it's trusted here.
     """
     state = _line_state_for_receipt(token, org, asn_id, asn_line_id, location=location)
     if not state.get("success"):
@@ -469,6 +499,7 @@ def receive_line(
         token,
         org,
         location=state["dest"],
+        staging_location_id=staging_location_id or None,
     )
     ok = result.get("success", True) if isinstance(result, dict) else True
     return {

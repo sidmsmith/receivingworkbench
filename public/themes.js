@@ -452,7 +452,9 @@
   }
 
   function loadTheme(themeLogo) {
-    const savedTheme = localStorage.getItem('selectedTheme') || 'default';
+    // TEMPORARY: default to 'manhattan' instead of 'default' when nothing is
+    // saved yet. Revert to 'default' once this is no longer needed.
+    const savedTheme = localStorage.getItem('selectedTheme') || 'manhattan';
     applyTheme(savedTheme, themeLogo);
   }
 

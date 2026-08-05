@@ -7,7 +7,12 @@
     validAsnIds: new Set(),
     asn: null, // last loaded ASN payload from /api/load_asn
     selectedLineNumber: null,
+    stagingLocations: [], // [{locationId, displayLocation}]
+    stagingLocationId: "", // resolved LocationId, "" if none/invalid
+    stagingLocationValid: true, // blank counts as valid (optional field)
   };
+
+  const STAGING_LOCATION_STORAGE_KEY = "rw_staging_location";
 
   const el = {
     filtersScreen: document.getElementById("filtersScreen"),
@@ -29,6 +34,11 @@
     partialLineBtn: document.getElementById("partialLineBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
+    stagingLocationInput: document.getElementById("stagingLocationInput"),
+    stagingLocationSearchBtn: document.getElementById("stagingLocationSearchBtn"),
+    stagingLocationDropdown: document.getElementById("stagingLocationDropdown"),
+    stagingLocationList: document.getElementById("stagingLocationList"),
+    stagingLocationHint: document.getElementById("stagingLocationHint"),
     actionStatus: document.getElementById("actionStatus"),
     partialLineInfo: document.getElementById("partialLineInfo"),
     partialQtyInput: document.getElementById("partialQtyInput"),
@@ -43,7 +53,8 @@
     themeList: document.getElementById("themeList"),
   };
 
-  /** Case-insensitive query params: org/organization, theme, asn/asnid/asn_id/asn-id */
+  /** Case-insensitive query params: org/organization, theme, asn/asnid/asn_id/asn-id,
+   *  staginglocation/staging_location/staging-location */
   function parseUrlParams() {
     const params = new URLSearchParams(window.location.search);
     const ci = {};
@@ -54,6 +65,9 @@
       org: String(ci.org || ci.organization || "").trim(),
       theme: String(ci.theme || "").trim(),
       asn: String(ci.asn || ci.asnid || ci.asn_id || ci["asn-id"] || "").trim(),
+      stagingLocation: String(
+        ci.staginglocation || ci.staging_location || ci["staging-location"] || ""
+      ).trim(),
     };
   }
 
@@ -148,6 +162,7 @@
             : "";
       setStatus("Authenticated " + via + ". Preloading ASNs…", "success");
       await preload();
+      await preloadStagingLocations();
       await applyUrlAsnBoot();
       return true;
     } catch (e) {
@@ -246,10 +261,106 @@
       .join("");
   }
 
+  // --- Staging location ---
+
+  function resolveStagingLocationText(text) {
+    const t = (text || "").trim();
+    if (!t) return { valid: true, locationId: "" };
+    const lower = t.toLowerCase();
+    const match = state.stagingLocations.find(
+      (l) => l.locationId.toLowerCase() === lower || l.displayLocation.toLowerCase() === lower
+    );
+    return match ? { valid: true, locationId: match.locationId } : { valid: false, locationId: "" };
+  }
+
+  function evaluateStagingLocation() {
+    const raw = el.stagingLocationInput.value;
+    const result = resolveStagingLocationText(raw);
+    state.stagingLocationId = result.locationId;
+    state.stagingLocationValid = result.valid;
+    el.stagingLocationInput.classList.toggle("invalid", !result.valid);
+    el.stagingLocationHint.textContent = result.valid ? "" : "Staging location not found.";
+    if (result.valid) {
+      if (raw.trim()) {
+        localStorage.setItem(
+          STAGING_LOCATION_STORAGE_KEY,
+          JSON.stringify({ text: raw.trim(), locationId: result.locationId })
+        );
+      } else {
+        localStorage.removeItem(STAGING_LOCATION_STORAGE_KEY);
+      }
+    }
+    updateLineActionButtons();
+  }
+
+  function renderStagingLocationList(filterText) {
+    const filter = (filterText || "").trim().toLowerCase();
+    const matches = state.stagingLocations.filter(
+      (l) =>
+        !filter ||
+        l.displayLocation.toLowerCase().includes(filter) ||
+        l.locationId.toLowerCase().includes(filter)
+    );
+    const shown = matches.slice(0, 100);
+    if (!shown.length) {
+      el.stagingLocationList.innerHTML = '<li class="empty">No matching locations</li>';
+      return;
+    }
+    el.stagingLocationList.innerHTML = shown
+      .map((l) => `<li data-display="${escapeAttr(l.displayLocation)}">${escapeHtml(l.displayLocation)}</li>`)
+      .join("");
+    if (matches.length > shown.length) {
+      el.stagingLocationList.innerHTML += `<li class="empty">${matches.length - shown.length} more — keep typing to narrow</li>`;
+    }
+  }
+
+  function openStagingLocationDropdown() {
+    renderStagingLocationList(el.stagingLocationInput.value);
+    el.stagingLocationDropdown.classList.add("visible");
+  }
+
+  function closeStagingLocationDropdown() {
+    el.stagingLocationDropdown.classList.remove("visible");
+  }
+
+  async function preloadStagingLocations() {
+    try {
+      const data = await api("preload_staging_locations", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+      });
+      if (data.success) {
+        state.stagingLocations = data.entries || [];
+      }
+    } catch (e) {
+      // Non-fatal — staging location is optional; leave the field usable-but-empty.
+    }
+    applyStagingLocationBoot();
+  }
+
+  function applyStagingLocationBoot() {
+    let text = "";
+    if (urlParams.stagingLocation) {
+      text = urlParams.stagingLocation;
+    } else {
+      try {
+        const saved = JSON.parse(localStorage.getItem(STAGING_LOCATION_STORAGE_KEY) || "null");
+        if (saved && saved.text) text = saved.text;
+      } catch (e) {
+        // ignore malformed storage
+      }
+    }
+    el.stagingLocationInput.value = text;
+    evaluateStagingLocation();
+  }
+
   function updateLineActionButtons() {
     const hasSelection = state.selectedLineNumber !== null;
-    el.partialLineBtn.disabled = !hasSelection;
-    el.fullLineBtn.disabled = !hasSelection;
+    const stagingOk = state.stagingLocationValid;
+    el.partialLineBtn.disabled = !hasSelection || !stagingOk;
+    el.fullLineBtn.disabled = !hasSelection || !stagingOk;
+    el.allLinesBtn.disabled = !stagingOk;
   }
 
   function selectLine(lineNumber) {
@@ -341,6 +452,7 @@
       asnLineId,
       mode,
       quantity,
+      stagingLocationId: state.stagingLocationId || "",
     });
   }
 
@@ -512,6 +624,30 @@
   el.partialLineConfirmBtn.addEventListener("click", confirmPartialLine);
   el.allLinesBtn.addEventListener("click", openAllLinesModal);
   el.allLinesConfirmBtn.addEventListener("click", confirmAllLines);
+
+  el.stagingLocationInput.addEventListener("input", () => {
+    evaluateStagingLocation();
+    if (el.stagingLocationDropdown.classList.contains("visible")) {
+      renderStagingLocationList(el.stagingLocationInput.value);
+    }
+  });
+  el.stagingLocationSearchBtn.addEventListener("click", () => {
+    if (el.stagingLocationDropdown.classList.contains("visible")) {
+      closeStagingLocationDropdown();
+    } else {
+      openStagingLocationDropdown();
+    }
+  });
+  el.stagingLocationList.addEventListener("click", (e) => {
+    const li = e.target.closest("li[data-display]");
+    if (!li) return;
+    el.stagingLocationInput.value = li.dataset.display;
+    evaluateStagingLocation();
+    closeStagingLocationDropdown();
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".staging-location-input-row")) closeStagingLocationDropdown();
+  });
 
   if (window.InspectionThemes) {
     // Theme=N hides the picker; Theme=<key> (case-insensitive) pre-selects a theme.

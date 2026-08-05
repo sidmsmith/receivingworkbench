@@ -38,13 +38,26 @@ A desktop MAWM app for a warehouse dock worker to receive against an ASN.
   pre-selects a theme, `theme=N` hides the theme picker button.
 - Collapsed accordion below the lines table, "Received LPNs (N)", listing
   every LPN linked to the ASN: LPN, Status (`Lpn[].LpnStatus`, e.g.
-  "Received"), Location (`CurrentLocationId` — blank until put away, since
-  this app's own receives don't pass one), Item ("MIXED" if the LPN holds
-  more than one), Description (blank if mixed), Qty + UOM (blank if mixed),
-  Condition Code (comma-separated if more than one). Condition codes
-  required their own endpoint — `dcinventory/containerCondition/search` —
-  since neither `ilpn/search` nor `inventory/search` expose them despite
-  `lpn/receive`'s own response echoing one back.
+  "Received"), Location (`CurrentLocationId` — blank until put away or
+  unless a Staging Location was set at receive time, see below), Item
+  ("MIXED" if the LPN holds more than one), Description (blank if mixed),
+  Qty + UOM (blank if mixed), Condition Code (comma-separated if more than
+  one). Condition codes required their own endpoint —
+  `dcinventory/containerCondition/search` — since neither `ilpn/search`
+  nor `inventory/search` expose them despite `lpn/receive`'s own response
+  echoing one back.
+- **Staging Location** field next to the action buttons: optional, free
+  text (a `DisplayLocation` or location barcode), with a search icon that
+  opens a filterable dropdown of active STAGING locations
+  (`dcinventory/location/quickSearch`, `LocationTypeId='STAGING'`).
+  Whatever's typed is resolved against that preloaded list (matching
+  either `LocationId` or `DisplayLocation`, case-insensitive); an
+  unresolved value turns the field red and disables Partial/Full/All
+  Lines until it's cleared or corrected — blank is always valid (the
+  field is optional). A resolved value is persisted to `localStorage` and
+  restored on next load; `staginglocation`/`staging_location`/
+  `staging-location` as a URL param pre-fills it the same way `asn` does.
+  When set, it's sent as `"LocationId"` on every `lpn/receive` call.
 
 **Known open items** (see comments in `rw_service.py`/`mawm_client.py` for
 detail):

@@ -22,6 +22,7 @@ ILPN_GENERATE_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/generateIlpnIds"
 INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
 ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
 CONTAINER_CONDITION_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/containerCondition/search"
+LOCATION_QUICKSEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/location/quickSearch"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -334,6 +335,7 @@ def receive_lpn(
     location: str = None,
     transaction_id: str = "Receiving",
     receiving_strategy: str = "Receiving Strategy",
+    staging_location_id: str = None,
 ) -> dict:
     """POST receiving/lpn/receive — books received quantity against a new LPN.
 
@@ -360,6 +362,8 @@ def receive_lpn(
         "ReceivingStrategy": receiving_strategy,
         "UserInputLineItemList": line_items,
     }
+    if staging_location_id:
+        payload["LocationId"] = staging_location_id
     response = _post(
         LPN_RECEIVE_URL,
         headers=build_receiving_headers(token, org, location=location),
@@ -493,3 +497,24 @@ def search_container_conditions(
         if code not in bucket:
             bucket.append(code)
     return out
+
+
+def search_staging_locations(token: str, org: str, location: str = None) -> List[dict]:
+    """All active STAGING locations, for the receiving staging-location picker."""
+    token = normalize_token(token)
+    payload = {
+        "Query": "IsActive=true and LocationTypeId='STAGING'",
+        "Template": {"LocationId": "", "DisplayLocation": ""},
+        "Size": 1000,
+        "Sort": [{"attribute": "LocationId", "direction": "ASC"}],
+    }
+    response = _post(
+        LOCATION_QUICKSEARCH_URL,
+        headers=build_receiving_headers(token, org, location=location),
+        json=payload,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"location quickSearch failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
