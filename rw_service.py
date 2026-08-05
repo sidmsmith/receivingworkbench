@@ -89,6 +89,9 @@ def preload_staging_locations(
                 "displayLocation": str(row.get("DisplayLocation") or "").strip() or location_id,
             }
         )
+    # The MAWM query itself sorts by LocationId (asked for explicitly); the
+    # picker should read by DisplayLocation instead, so re-sort here.
+    entries.sort(key=lambda e: e["displayLocation"].lower())
     return {
         "success": True,
         "count": len(entries),
