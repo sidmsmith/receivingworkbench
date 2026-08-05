@@ -6,6 +6,7 @@
     facility: "",
     validAsnIds: new Set(),
     asn: null, // last loaded ASN payload from /api/load_asn
+    selectedLineNumber: null,
   };
 
   const el = {
@@ -23,6 +24,9 @@
     resultsStatus: document.getElementById("resultsStatus"),
     asnMeta: document.getElementById("asnMeta"),
     linesBody: document.getElementById("linesBody"),
+    partialLineBtn: document.getElementById("partialLineBtn"),
+    fullLineBtn: document.getElementById("fullLineBtn"),
+    allLinesBtn: document.getElementById("allLinesBtn"),
     busyOverlay: document.getElementById("busyOverlay"),
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
@@ -175,10 +179,12 @@
   }
 
   function renderLines(lines) {
+    state.selectedLineNumber = null;
+    updateLineActionButtons();
     el.linesBody.innerHTML = (lines || [])
       .map(
         (line) => `
-        <tr class="line-row">
+        <tr class="line-row" data-line-number="${escapeAttr(line.lineNumber)}">
           <td>${escapeHtml(line.lineNumber)}</td>
           <td>
             <span class="item-cell">
@@ -193,6 +199,20 @@
         </tr>`
       )
       .join("");
+  }
+
+  function updateLineActionButtons() {
+    const hasSelection = state.selectedLineNumber !== null;
+    el.partialLineBtn.disabled = !hasSelection;
+    el.fullLineBtn.disabled = !hasSelection;
+  }
+
+  function selectLine(lineNumber) {
+    state.selectedLineNumber = lineNumber;
+    el.linesBody.querySelectorAll("tr.line-row").forEach((row) => {
+      row.classList.toggle("selected", row.dataset.lineNumber === String(lineNumber));
+    });
+    updateLineActionButtons();
   }
 
   function showResults() {
@@ -252,6 +272,11 @@
   });
   el.loadAsnBtn.addEventListener("click", loadAsn);
   el.backToFilters.addEventListener("click", showFilters);
+  el.linesBody.addEventListener("click", (e) => {
+    const row = e.target.closest("tr.line-row");
+    if (!row) return;
+    selectLine(row.dataset.lineNumber);
+  });
 
   bindItemImagePreview(el.linesBody);
 

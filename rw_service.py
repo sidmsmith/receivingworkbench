@@ -62,6 +62,30 @@ def preload_asn_index(
     }
 
 
+def _package_conversion_factor(item: dict, quantity_uom_id: str):
+    """Find the item's standard ItemPackage entry for this UOM code.
+
+    MAWM's AsnLine.ShippedQuantity is always expressed in the item's base
+    unit; QuantityUomId is the *code* the line was shipped in (UNIT, PACK,
+    BUNDLE, LPN, PALLET, or a custom code). The item's ItemPackage[] array
+    holds the actual conversion factor (Quantity) and human label (UomId)
+    for that code — e.g. StandardQuantityUomId="LPN" -> UomId="Case",
+    Quantity=40 means 40 base units per case. Falls back to (1, raw code)
+    when the item has no matching standard package entry (e.g. an item
+    whose only unit *is* the base unit).
+    """
+    code = str(quantity_uom_id or "").strip()
+    for pkg in item.get("ItemPackage") or []:
+        if pkg.get("Standard") is not True:
+            continue
+        if str(pkg.get("StandardQuantityUomId") or "").strip() != code:
+            continue
+        factor = _dec(pkg.get("Quantity"))
+        if factor > 0:
+            return factor, str(pkg.get("UomId") or code)
+    return Decimal("1"), code or "UNIT"
+
+
 def _asn_line_id(line: dict) -> str:
     for key in ("AsnLineId", "asnLineId", "PK", "Unique_Identifier"):
         val = line.get(key)
@@ -118,8 +142,11 @@ def load_asn_for_receiving(
             continue
         asn_line_id = _asn_line_id(line)
         item = items.get(item_id) or {}
-        shipped = _dec(line.get("ShippedQuantity"))
-        received = received_by_line.get(asn_line_id, Decimal("0"))
+        shipped_base = _dec(line.get("ShippedQuantity"))
+        received_base = received_by_line.get(asn_line_id, Decimal("0"))
+        factor, display_uom = _package_conversion_factor(
+            item, line.get("QuantityUomId")
+        )
         lines.append(
             {
                 "lineNumber": idx,
@@ -133,9 +160,9 @@ def load_asn_for_receiving(
                 or item.get("imageUrl")
                 or item.get("ImageURL")
                 or "",
-                "shippedQuantity": _num(shipped),
-                "receivedQuantity": _num(received),
-                "quantityUomId": line.get("QuantityUomId") or "UNIT",
+                "shippedQuantity": _num(shipped_base / factor),
+                "receivedQuantity": _num(received_base / factor),
+                "quantityUomId": display_uom,
             }
         )
 

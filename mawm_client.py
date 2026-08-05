@@ -246,6 +246,15 @@ def search_items(
             "ItemId": "",
             "Description": "",
             "ImageUrl": "",
+            "DisplayUomId": "",
+            "ItemPackage": [
+                {
+                    "UomId": None,
+                    "StandardQuantityUomId": None,
+                    "Quantity": None,
+                    "Standard": None,
+                }
+            ],
         },
     }
     headers = build_receiving_headers(token, org, location=location)
