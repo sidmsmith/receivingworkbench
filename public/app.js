@@ -91,12 +91,6 @@
     return body;
   }
 
-  function fmtQty(v) {
-    if (v === null || v === undefined || v === "") return "0";
-    const n = Number(v);
-    return Number.isNaN(n) ? String(v) : String(n);
-  }
-
   function fmtCount(n, singular, plural) {
     const count = Number(n) || 0;
     const word = count === 1 ? singular : plural || singular + "s";
@@ -224,9 +218,8 @@
             </span>
           </td>
           <td>${escapeHtml(line.description)}</td>
-          <td class="col-qty">${fmtQty(line.shippedQuantity)}</td>
-          <td class="col-qty">${fmtQty(line.receivedQuantity)}</td>
-          <td class="col-uom">${escapeHtml(line.quantityUomId)}</td>
+          <td class="col-qty-wide">${escapeHtml(line.shippedQuantityLabel)}</td>
+          <td class="col-qty-wide">${escapeHtml(line.receivedQuantityLabel)}</td>
         </tr>`
       )
       .join("");
@@ -368,7 +361,7 @@
     el.partialLineInfo.innerHTML =
       "<strong>Line " + escapeHtml(line.lineNumber) + "</strong> — " +
       escapeHtml(line.itemId) + " " + escapeHtml(line.description) +
-      "<br/>Remaining: " + remaining + " " + escapeHtml(line.quantityUomId);
+      "<br/>Remaining: " + escapeHtml(line.remainingQuantityLabel);
     el.partialQtyInput.value = remaining;
     el.partialQtyInput.max = remaining;
     el.partialQtyInput.min = 0;
@@ -427,7 +420,7 @@
       .map(
         (l) =>
           "<li>Line " + escapeHtml(l.lineNumber) + " — " + escapeHtml(l.itemId) + " " +
-          escapeHtml(l.description) + ": " + remainingQty(l) + " " + escapeHtml(l.quantityUomId) + "</li>"
+          escapeHtml(l.description) + ": " + escapeHtml(l.remainingQuantityLabel) + "</li>"
       )
       .join("");
     allLinesModal.show();

@@ -89,6 +89,40 @@ def _package_conversion_factor(item: dict, quantity_uom_id: str):
     return Decimal("1"), code or "UNIT"
 
 
+def _unit_label(item: dict) -> str:
+    """The item's base-unit ItemPackage label (e.g. "units"), for the
+    remainder portion of a mixed-UOM display. Falls back to "units"."""
+    for pkg in item.get("ItemPackage") or []:
+        if pkg.get("Standard") is True and str(pkg.get("StandardQuantityUomId") or "") == "UNIT":
+            label = str(pkg.get("UomId") or "").strip()
+            if label:
+                return label
+    return "units"
+
+
+def _format_mixed_qty(base_qty: Decimal, factor: Decimal, pack_uom: str, unit_uom: str) -> str:
+    """Format a base-unit quantity the same way MAWM's RF receiving UI does.
+
+    Verified directly against a live RF Receiving session capture: a
+    quantity that doesn't divide evenly into the item's pack UOM is shown
+    as "{whole packs} {packUom} {remainder} {unit label}" (e.g.
+    "0 packs 1 units" for 1 base unit of a 10-per-pack item) — never as a
+    decimal pack count. When it divides evenly, only the pack part is
+    shown ("3 Case", no "0 units" suffix). Zero quantity renders as "" —
+    RF's own "Received quantity" column is blank until something has
+    actually been received, not "0 <uom>".
+    """
+    if base_qty <= 0:
+        return ""
+    if factor <= 0 or factor == 1:
+        return f"{_num(base_qty)} {pack_uom}"
+    quotient = int(base_qty // factor)
+    remainder = base_qty - (Decimal(quotient) * factor)
+    if remainder == 0:
+        return f"{quotient} {pack_uom}"
+    return f"{quotient} {pack_uom} {_num(remainder)} {unit_uom}"
+
+
 def _asn_line_id(line: dict) -> str:
     for key in ("AsnLineId", "asnLineId", "PK", "Unique_Identifier"):
         val = line.get(key)
@@ -156,9 +190,11 @@ def load_asn_for_receiving(
         item = items.get(item_id) or {}
         shipped_base = _dec(line.get("ShippedQuantity"))
         received_base = received_by_line.get(asn_line_id, Decimal("0"))
+        remaining_base = shipped_base - received_base
         factor, display_uom = _package_conversion_factor(
             item, line.get("QuantityUomId")
         )
+        unit_label = _unit_label(item)
         lines.append(
             {
                 "lineNumber": idx,
@@ -172,9 +208,22 @@ def load_asn_for_receiving(
                 or item.get("imageUrl")
                 or item.get("ImageURL")
                 or "",
+                # Decimal pack-uom quantities — used for remaining/qty math
+                # (Partial Line default+cap), not for display.
                 "shippedQuantity": _num(shipped_base / factor),
                 "receivedQuantity": _num(received_base / factor),
                 "quantityUomId": display_uom,
+                # MAWM RF-style mixed "{packs} {uom} {remainder} {unit}"
+                # display strings — what the table actually renders.
+                "shippedQuantityLabel": _format_mixed_qty(
+                    shipped_base, factor, display_uom, unit_label
+                ),
+                "receivedQuantityLabel": _format_mixed_qty(
+                    received_base, factor, display_uom, unit_label
+                ),
+                "remainingQuantityLabel": _format_mixed_qty(
+                    remaining_base, factor, display_uom, unit_label
+                ),
             }
         )
 

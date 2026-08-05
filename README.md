@@ -12,9 +12,13 @@ A desktop MAWM app for a warehouse dock worker to receive against an ASN.
   preloaded, receivable ASN.
 - Loads the ASN and displays its lines: Line #, Item (with a small item
   image thumbnail — hover to enlarge), Description, Shipped Qty, Received
-  Qty, UOM — quantities are converted from base units into each item's
-  actual receiving UOM (Case, Pack, Pallet, etc.) via its `ItemPackage[]`
-  conversion table, not shown as raw base-unit counts.
+  Qty. Quantities are formatted exactly like MAWM's own RF Receiving UI
+  (verified against a live RF session capture) — converted from base units
+  into the item's pack UOM (Case, Pack, Pallet, etc.) via its
+  `ItemPackage[]` conversion table, shown as a mixed "{packs} {uom}
+  {remainder} units" string when it doesn't divide evenly (e.g.
+  "0 packs 1 units"), just the pack count when it does (e.g. "3 Case"),
+  and blank (not "0 <uom>") when nothing's been received yet.
 - Click a line to select it, then:
   - **Full Line** — receives the entire remaining quantity, no confirmation.
   - **Partial Line** — modal to choose a quantity (defaults to, capped at,
