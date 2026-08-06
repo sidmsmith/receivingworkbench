@@ -751,6 +751,8 @@
     });
   }
 
+  api("app_opened", {}).catch(() => {});
+
   // URL boot: Organization/org auto-authenticates (ASN deep-link is applied
   // inside authenticate() once preload completes, see applyUrlAsnBoot()).
   if (urlParams.org) {

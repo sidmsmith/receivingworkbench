@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from flask import Flask, jsonify, request
+import requests
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -26,9 +27,23 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "receivingworkbench-app"
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.1.10"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
+USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
+USAGE_INGEST_SECRET = os.getenv("MANHATTAN_USAGE_INGEST_SECRET", "").strip()
+
+
+def forward_usage_event(payload):
+    if not USAGE_INGEST_URL:
+        return
+    headers = {"Content-Type": "application/json"}
+    if USAGE_INGEST_SECRET:
+        headers["Authorization"] = f"Bearer {USAGE_INGEST_SECRET}"
+    try:
+        requests.post(USAGE_INGEST_URL, json=payload, headers=headers, timeout=8, verify=False)
+    except Exception as e:
+        print(f"[usage] Forward failed: {e}")
 
 
 def read_local_token_file() -> str:
@@ -69,6 +84,19 @@ def _require_auth_fields(data):
     return org, token, None
 
 
+@app.route("/api/app_opened", methods=["POST"])
+def app_opened():
+    forward_usage_event(
+        {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "event_name": "app_opened",
+            **(_json() or {}),
+        }
+    )
+    return jsonify({"success": True})
+
+
 @app.route("/api/auth", methods=["POST"])
 def auth():
     data = _json()
@@ -81,6 +109,15 @@ def auth():
         )
     token, source = resolve_bearer_token(org)
     if token:
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "auth_success",
+                "org": org,
+                "source": source,
+            }
+        )
         return jsonify(
             {
                 "success": True,
@@ -90,6 +127,9 @@ def auth():
                 "fromTokenFile": source == "token-file",
             }
         )
+    forward_usage_event(
+        {"app_name": APP_NAME, "app_version": APP_VERSION, "event_name": "auth_failed", "org": org}
+    )
     has_oauth = bool(PASSWORD and CLIENT_SECRET)
     has_file = TOKEN_FILE.is_file()
     hint = (
@@ -158,9 +198,28 @@ def load_asn():
     asn_id = (data.get("asnId") or data.get("asn_id") or "").strip()
     try:
         result = load_asn_for_receiving(token, org, asn_id, location=location)
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "load_asn_completed" if result.get("success") else "load_asn_failed",
+                "org": org,
+                "asnId": asn_id,
+            }
+        )
         return jsonify(result)
     except Exception as e:
         print(f"[LOAD_ASN] {e}")
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "load_asn_failed",
+                "org": org,
+                "asnId": asn_id,
+                "error": str(e),
+            }
+        )
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -195,9 +254,32 @@ def receive_line_route():
             location=location,
             staging_location_id=staging_location_id or None,
         )
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "receive_line_completed" if result.get("success") else "receive_line_failed",
+                "org": org,
+                "asnId": asn_id,
+                "asnLineId": asn_line_id,
+                "mode": mode,
+                "receivingStrategy": receiving_strategy,
+            }
+        )
         return jsonify(result)
     except Exception as e:
         print(f"[RECEIVE_LINE] {e}")
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "receive_line_failed",
+                "org": org,
+                "asnId": asn_id,
+                "asnLineId": asn_line_id,
+                "error": str(e),
+            }
+        )
         return jsonify({"success": False, "error": str(e)}), 500
 
 
