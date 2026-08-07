@@ -27,7 +27,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "receivingworkbench-app"
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -88,10 +88,10 @@ def _require_auth_fields(data):
 def app_opened():
     forward_usage_event(
         {
+            **(_json() or {}),
             "app_name": APP_NAME,
             "app_version": APP_VERSION,
             "event_name": "app_opened",
-            **(_json() or {}),
         }
     )
     return jsonify({"success": True})
