@@ -566,15 +566,18 @@
   /**
    * Calls receive_line, and if the response comes back with a MAWM
    * warning (`result.warning === true`), shows the Confirm/Cancel modal
-   * and — on Confirm — retries with the same generated LPN plus that
-   * warning's code added to warningOverrides (see rw_service.receive_line()
-   * for why the LPN is reused rather than re-generated per attempt).
-   * Loops in case a second, different warning follows the first
-   * confirmation. The override mechanism isn't confirmed to actually
-   * clear anything against MAWM yet (see CLAUDE.md's "Warning message
-   * handling" section) — if the identical warning code comes back again
-   * after already being confirmed once, this stops retrying and returns
-   * a plain failure instead of looping forever on the same warning.
+   * and — on Confirm — retries with that warning's code added to
+   * warningOverrides. A retry with any warningOverrides set skips the
+   * core receive API (no working override there) and instead drives
+   * the DMM Mobile Facade "Receiving" workflow server-side (see
+   * rw_service.receive_via_dmm_workflow()), which is the CONFIRMED-live
+   * way to actually clear the warning — that workflow mints its own
+   * iLPN internally, so the `lpnId` this sends back is informational
+   * only past the first call, not reused. Loops in case a second,
+   * different warning follows the first confirmation. If the identical
+   * warning code somehow comes back again after already being
+   * confirmed once, this stops retrying and returns a plain failure
+   * instead of looping forever — a safety net, not the expected path.
    */
   async function receiveLineWithWarningHandling(asnLineId, mode, quantity) {
     const overrides = {};
@@ -586,7 +589,7 @@
           success: false,
           warning: true,
           error:
-            "Warning could not be cleared (override not yet supported for receiving): " +
+            "Warning recurred after being confirmed — could not complete this receive: " +
             (result.messageText || result.messageId || "unknown warning"),
         };
       }

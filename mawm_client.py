@@ -5,6 +5,7 @@ import os
 import re
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 import urllib3
@@ -24,6 +25,49 @@ ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
 CONTAINER_CONDITION_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/containerCondition/search"
 LOCATION_QUICKSEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/location/quickSearch"
 TRANSACTION_SEARCH_URL = f"{HOST}/receiving/api/task/transaction/search"
+
+# CONFIRMED live (2026-08-08 HAR capture of a real mobile RF Receiving
+# session, missingdimensions.har) — the DMM Mobile Facade "Receiving"
+# workflow, structurally identical to taskcompletion's Putaway flow.
+# This is what real RF Receiving actually uses, and the only confirmed
+# way to clear a receiving WARNING (receive_lpn()'s core-API endpoint
+# detects the same warning but has no known override for it). Full
+# confirmed sequence — every step resubmits the ENTIRE workflowVO from
+# the previous response, mutating only the one field noted:
+#   1. workflow_init("Receiving", "Receive") -> currentState="AcceptASN".
+#      ("Receiving" here is the selected TransactionId, not a fixed
+#      literal — the HAR happened to use this app's own default.)
+#   2. state.ASNId = <asn id>, execute AcceptASN -> "AcceptStagingLocation".
+#   3. state.EnteredLocation = <staging location>, execute
+#      AcceptStagingLocation -> "AcceptLPN". UNCONFIRMED whether this
+#      can be blank — the capture always had a real staging location.
+#   4. state.LPNId = "" (blank — CONFIRMED this auto-assigns a fresh
+#      iLPN server-side, e.g. "LPN09159"; do not pre-generate one for
+#      this path), execute AcceptLPN -> "AcceptItem".
+#   5. state.itemBarcode = <item id>, execute AcceptItem. This is where
+#      RCV::995 ("Item Missing Critical Dims") fired: 400,
+#      state.errorVOList = [{errorCode: "RCV::995", errorCategory:
+#      "WARNING", errorMessage: "...", componentName:
+#      "com-manh-cp-receiving"}], state.warningOverrideList = [] going in.
+#   6. Override, CONFIRMED live: resubmit the same AcceptItem action
+#      with state.warningOverrideList = ["RCV::995"] added (errorVOList
+#      left as-is from the error response) -> 200, errorVOList cleared,
+#      currentState="AcceptQuantity". Same mechanism as Putaway's
+#      apply_warning_overrides() below — no receiving-specific change
+#      to that function needed.
+#   7. state.EnteredQuantity.scannedQuantity1 = <quantity>, execute
+#      AcceptQuantity -> currentState loops back to "AcceptLPN" (ready
+#      for the next item/LPN). UNCONFIRMED whether this wants base or
+#      display-UOM quantity — the only captured example was a UNIT-uom
+#      item (factor 1, indistinguishable).
+# See CLAUDE.md's "Warning message handling" section and
+# rw_service.receive_via_dmm_workflow() for the orchestration.
+DMM_WORKFLOW_INIT_URL = f"{HOST}/dmmobile-facade/api/dmmobile-facade/workflow/init"
+DMM_WORKFLOW_EXECUTE_URL_TEMPLATE = (
+    f"{HOST}/dmmobile-facade/services/rest/workflow/execute/"
+    "workflowScriptName/{script}/stateName/{state}/actionName/{action}"
+)
+RECEIVING_WORKFLOW_SCRIPT_NAME = "Receiving"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -337,7 +381,6 @@ def receive_lpn(
     transaction_id: str = "Receiving",
     receiving_strategy: str = "Receiving Strategy",
     staging_location_id: str = None,
-    warning_overrides: Optional[Dict[str, str]] = None,
 ) -> dict:
     """POST receiving/lpn/receive — books received quantity against a new LPN.
 
@@ -356,18 +399,18 @@ def receive_lpn(
     The defaults here ("Receiving" / "Receiving Strategy") only apply if
     a caller doesn't supply them.
 
-    `warning_overrides` — best-effort, UNCONFIRMED. A large Quantity may
-    trip the item's MaxLpnQuantity (item master) and come back as a
-    WARNING (see extract_warning()) rather than a hard error. Unlike
-    taskcompletion's DMM Mobile Facade flow, there's no known override
-    contract yet for this plain core-API endpoint — taskcompletion
-    confirmed a guessed `userInputs: {code: code}` shape does NOT clear
-    a warning on a similar core endpoint
-    (`putaway/api/putaway/execution/container/move`), so this
-    deliberately does not resend that same known-wrong guess. See
-    CLAUDE.md's "Warning message handling" section — the real contract
-    still needs a HAR capture of a live receiving warning before this
-    parameter can do anything.
+    This endpoint can surface a WARNING (see extract_warning()) — e.g.
+    `RCV::995` when an item is missing critical dimensions — but has NO
+    known override contract of its own: taskcompletion confirmed a
+    guessed `userInputs: {code: code}` shape does NOT clear a warning on
+    a similar core endpoint (`putaway/api/putaway/execution/container
+    /move`), and this app's own HAR capture (2026-08-08,
+    `missingdimensions.har`) confirmed real RF Receiving doesn't even
+    use this endpoint for a warning-clearing retry — it drives the DMM
+    Mobile Facade "Receiving" workflow instead. See
+    rw_service.receive_via_dmm_workflow() for the confirmed-working
+    override path; this function has no `warning_overrides` parameter
+    on purpose, to avoid implying one exists here.
     """
     token = normalize_token(token)
     payload = {
@@ -379,9 +422,6 @@ def receive_lpn(
     }
     if staging_location_id:
         payload["LocationId"] = staging_location_id
-    # warning_overrides is intentionally not applied to the payload yet —
-    # see the docstring above. Accepted now so the caller/frontend retry
-    # loop can be built ahead of the override contract being known.
     response = _post(
         LPN_RECEIVE_URL,
         headers=build_receiving_headers(token, org, location=location),
@@ -405,11 +445,15 @@ def receive_lpn(
 def extract_warning(body) -> Optional[Dict[str, str]]:
     """Best-effort scan for an overrideable WARNING in a MAWM response.
 
-    Checks the standard `messages.Message[]` envelope (Type=="WARNING").
-    Ported from taskcompletion/mawm_client.py's extract_warning() —
-    receiving only ever hits a plain core-API endpoint here, not a DMM
-    Mobile Facade workflow, so the `workflowVO.header.state.errorVOList`
-    branch that function also checks doesn't apply and is left out.
+    Checks both shapes this app actually hits: the standard
+    `messages.Message[]` envelope (`Type=="WARNING"`, from the core
+    `receiving/lpn/receive` endpoint) and the DMM Mobile Facade
+    `workflowVO.header.state.errorVOList` shape (`errorCategory==
+    "WARNING"`, from the Receiving workflow — see
+    RECEIVING_WORKFLOW_SCRIPT_NAME's comment). Ported from
+    taskcompletion/mawm_client.py's extract_warning(); both branches
+    are now CONFIRMED live for receiving (2026-08-08), not just
+    inherited defensively.
     """
     if not isinstance(body, dict):
         return None
@@ -422,6 +466,17 @@ def extract_warning(body) -> Optional[Dict[str, str]]:
                 "code": str(msg.get("Code") or msg.get("MessageKey") or ""),
                 "text": str(msg.get("Description") or msg.get("Message") or ""),
             }
+
+    workflow_vo = body.get("workflowVO")
+    if isinstance(workflow_vo, dict):
+        state = ((workflow_vo.get("header") or {}).get("state") or {})
+        for err in state.get("errorVOList") or []:
+            if isinstance(err, dict) and str(err.get("errorCategory") or "").upper() == "WARNING":
+                return {
+                    "code": str(err.get("errorCode") or ""),
+                    "text": str(err.get("errorMessage") or ""),
+                }
+
     return None
 
 
@@ -441,6 +496,98 @@ def extract_message(body) -> str:
             if text:
                 return text
     return str(body.get("message") or body.get("messageKey") or "Receive failed")
+
+
+def workflow_init(
+    transaction_id: str, transaction_type: str, token: str, org: str, location: str = None
+) -> dict:
+    """CONFIRMED live — bootstrap a fresh DMM Mobile Facade workflow
+    session (see RECEIVING_WORKFLOW_SCRIPT_NAME's comment for the full
+    confirmed Receiving sequence). Body is a literal `{}`; everything
+    is driven by the query params. Returns the initial
+    `{"workflowVO": {...}}`. Ported from taskcompletion/mawm_client.py's
+    workflow_init(), which is domain-agnostic despite living in a
+    Putaway-focused file.
+    """
+    token = normalize_token(token)
+    url = (
+        f"{DMM_WORKFLOW_INIT_URL}"
+        f"?transactionId={quote(transaction_id)}&transactionType={quote(transaction_type)}"
+    )
+    response = _post(url, headers=build_receiving_headers(token, org, location=location), json={})
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
+        raise RuntimeError(
+            f"workflow init failed: {response.status_code} {response.text[:800]}"
+        )
+    return body
+
+
+def workflow_execute(
+    script_name: str,
+    state_name: str,
+    action_name: str,
+    workflow_vo: dict,
+    token: str,
+    org: str,
+    location: str = None,
+) -> dict:
+    """CONFIRMED live — resubmit a DMM Mobile Facade workflow action.
+    `workflow_vo` must be the complete object from the immediately
+    preceding call (init or execute) — every other field it carries is
+    required as-is. The scanned/entered input for this action (e.g.
+    `ASNId`, `EnteredLocation`, `LPNId`, `itemBarcode`,
+    `EnteredQuantity.scannedQuantity1`) lives *inside*
+    `workflow_vo["header"]["state"]` — the caller must set it there
+    before calling this, the same way `apply_warning_overrides()`
+    mutates `header.state.warningOverrideList`. Ported from
+    taskcompletion/mawm_client.py's workflow_execute() (there it warns
+    a stray top-level sibling field silently produces a generic
+    `serverError` for Putaway — same caution applies here).
+    """
+    token = normalize_token(token)
+    url = DMM_WORKFLOW_EXECUTE_URL_TEMPLATE.format(
+        script=script_name, state=state_name, action=action_name
+    )
+    payload = {"workflowVO": workflow_vo}
+    response = _post(url, headers=build_receiving_headers(token, org, location=location), json=payload)
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
+        raise RuntimeError(
+            f"workflow execute ({action_name}) failed: {response.status_code} {response.text[:800]}"
+        )
+    return body
+
+
+def apply_warning_overrides(workflow_vo: dict, warning_overrides: Optional[Dict[str, str]]) -> dict:
+    """Mutates (and returns) `workflow_vo` so its
+    `header.state.warningOverrideList` includes every code in
+    `warning_overrides` — the CONFIRMED live mechanism for clearing a
+    DMM Mobile Facade warning (see RECEIVING_WORKFLOW_SCRIPT_NAME's
+    comment). No-op if there's nothing to apply. Ported verbatim from
+    taskcompletion/mawm_client.py's apply_warning_overrides().
+    """
+    if not warning_overrides or not isinstance(workflow_vo, dict):
+        return workflow_vo
+    state = (workflow_vo.get("header") or {}).get("state")
+    if not isinstance(state, dict):
+        return workflow_vo
+    existing = list(state.get("warningOverrideList") or [])
+    for code in warning_overrides:
+        if code not in existing:
+            existing.append(code)
+    state["warningOverrideList"] = existing
+    return workflow_vo
 
 
 def search_inventory_by_container_item(

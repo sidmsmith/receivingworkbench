@@ -7,6 +7,8 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from mawm_client import (
+    RECEIVING_WORKFLOW_SCRIPT_NAME,
+    apply_warning_overrides,
     asn_status_description,
     extract_message,
     extract_warning,
@@ -23,6 +25,8 @@ from mawm_client import (
     search_items,
     search_receiving_transactions,
     search_staging_locations,
+    workflow_execute,
+    workflow_init,
 )
 
 
@@ -480,6 +484,134 @@ def _line_state_for_receipt(
     }
 
 
+def receive_via_dmm_workflow(
+    asn_id: str,
+    item_id: str,
+    quantity_base,
+    transaction_id: str,
+    token: str,
+    org: str,
+    location: str = None,
+    staging_location_id: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Receive one item against an ASN via the DMM Mobile Facade
+    "Receiving" workflow — CONFIRMED live via a real RF-session HAR
+    capture (`missingdimensions.har`, 2026-08-08). This is what real RF
+    Receiving actually uses, and the *only* confirmed way to clear a
+    receiving WARNING (e.g. `RCV::995`, "Item Missing Critical Dims") —
+    `receive_lpn()`'s core-API endpoint detects the same warning but has
+    no known override for it. See `mawm_client.py`'s
+    `RECEIVING_WORKFLOW_SCRIPT_NAME` comment for the full HAR-derived
+    field mapping this mirrors step for step.
+
+    Stateless by design, like taskcompletion's
+    `complete_container_putaway()`: every call — first attempt or a
+    Confirm retry — replays the whole sequence from a fresh
+    `workflow_init()`, with `warning_overrides` pre-applied to every
+    step before submitting, rather than round-tripping the large
+    workflowVO blob through the frontend between the warning and the
+    Confirm click. One side effect: `AcceptLPN`'s blank submission
+    auto-generates a fresh iLPN every retry (confirmed — this is the
+    correct way to call it, not a workaround), so a multi-warning
+    retry sequence can leave behind a harmless abandoned, empty
+    reserved iLPN per attempt before the one that finally succeeds.
+
+    `staging_location_id` maps to `AcceptStagingLocation`'s
+    `EnteredLocation` — UNCONFIRMED whether this can be submitted
+    blank; the HAR only captured a run with a real staging location
+    set. If this ReceivingCriteria actually requires one
+    (`LocateLpnToStagingId: "PROMPT_FOR_STAGING_LOCATION"` in the
+    captured config) and it's blank, that surfaces as a real
+    (non-warning) error from that step via `extract_message()` below —
+    not silently swallowed.
+
+    `quantity_base` is submitted to `AcceptQuantity`'s
+    `EnteredQuantity.scannedQuantity1` — UNCONFIRMED whether this
+    workflow wants base units or the item's display/pack UOM; the only
+    captured example was a UNIT-uom item (factor 1, so the two are
+    indistinguishable). Passed as base units here for consistency with
+    `receive_lpn()`'s own contract elsewhere in this app.
+    """
+    dest = resolve_location(org, location)
+    warning_overrides = warning_overrides or {}
+
+    init_resp = workflow_init(transaction_id, "Receive", token, org, location=dest)
+    workflow_vo = init_resp.get("workflowVO") if isinstance(init_resp, dict) else None
+    if not isinstance(workflow_vo, dict):
+        return {"success": False, "error": "Could not start the Receiving workflow"}
+
+    def run_step(state_name: str, field: str, value, vo: dict):
+        apply_warning_overrides(vo, warning_overrides)
+        vo["header"]["state"][field] = value
+        resp = workflow_execute(
+            RECEIVING_WORKFLOW_SCRIPT_NAME, state_name, state_name, vo, token, org, location=dest
+        )
+        warning = extract_warning(resp)
+        if warning and warning["code"] not in warning_overrides:
+            return None, {
+                "success": False,
+                "warning": True,
+                "messageId": warning["code"],
+                "messageText": warning["text"],
+                "mawmResponse": resp,
+            }
+        next_vo = resp.get("workflowVO") if isinstance(resp, dict) else None
+        if not isinstance(next_vo, dict):
+            return None, {"success": False, "error": extract_message(resp), "mawmResponse": resp}
+        return next_vo, None
+
+    workflow_vo, err = run_step("AcceptASN", "ASNId", asn_id, workflow_vo)
+    if err:
+        return err
+    workflow_vo, err = run_step(
+        "AcceptStagingLocation", "EnteredLocation", staging_location_id or "", workflow_vo
+    )
+    if err:
+        return err
+    workflow_vo, err = run_step("AcceptLPN", "LPNId", "", workflow_vo)
+    if err:
+        return err
+    # Capture the server-assigned LPN here, right after AcceptLPN — its
+    # value is only present in this response. AcceptQuantity's own
+    # response loops currentState back to "AcceptLPN" for the next item
+    # (confirmed in the HAR), which resets state.LPNId to blank again,
+    # so reading it from the *final* response instead would silently
+    # return None.
+    assigned_lpn_id = workflow_vo["header"]["state"].get("LPNId") or None
+
+    workflow_vo, err = run_step("AcceptItem", "itemBarcode", item_id, workflow_vo)
+    if err:
+        return err
+
+    apply_warning_overrides(workflow_vo, warning_overrides)
+    state = workflow_vo["header"]["state"]
+    state["EnteredQuantity"] = dict(state.get("EnteredQuantity") or {})
+    state["EnteredQuantity"]["scannedQuantity1"] = qty_for_payload(quantity_base)
+    qty_resp = workflow_execute(
+        RECEIVING_WORKFLOW_SCRIPT_NAME, "AcceptQuantity", "AcceptQuantity", workflow_vo, token, org, location=dest
+    )
+    warning = extract_warning(qty_resp)
+    if warning and warning["code"] not in warning_overrides:
+        return {
+            "success": False,
+            "warning": True,
+            "messageId": warning["code"],
+            "messageText": warning["text"],
+            "mawmResponse": qty_resp,
+        }
+
+    final_header = (qty_resp.get("workflowVO") or {}).get("header") if isinstance(qty_resp, dict) else {}
+    ok = isinstance(final_header, dict) and final_header.get("status") == "SUCCESS"
+    return {
+        "success": bool(ok),
+        "warning": False,
+        "lpnId": assigned_lpn_id,
+        "mawmResponse": qty_resp,
+        "error": None if ok else extract_message(qty_resp),
+    }
+
+
 def receive_line(
     token: str,
     org: str,
@@ -508,18 +640,19 @@ def receive_line(
     enforce that; fail rather than silently falling back to a default.
 
     `lpn_id`/`warning_overrides` back the Confirm/Cancel warning retry
-    (see CLAUDE.md's "Warning message handling" section): the frontend's
-    first call for a given attempt leaves `lpn_id` unset, so a fresh
-    iLPN is generated. If the result comes back `warning: True`, the
+    (see CLAUDE.md's "Warning message handling" section). The first call
+    for a given attempt leaves both unset and goes through the fast
+    core-API path (`receive_lpn()`) — unchanged, still what every normal
+    (no-warning) receive uses. If that comes back `warning: True`, the
     frontend shows a Confirm/Cancel modal and, on Confirm, resubmits
-    with that same `lpn_id` (so a retry doesn't abandon a freshly
-    generated, never-received iLPN per attempt and mint another) plus
-    the warning's code folded into `warning_overrides`. The override
-    itself isn't confirmed to clear anything against MAWM yet — see
-    mawm_client.receive_lpn()'s docstring — so today a retry mostly just
-    resubmits the identical request and will likely surface the same
-    warning again until the real override contract is learned from a
-    HAR capture.
+    with the warning's code folded into `warning_overrides` — a call
+    with `warning_overrides` set skips the core API entirely (it has no
+    working override, see `receive_lpn()`'s docstring) and instead runs
+    `receive_via_dmm_workflow()`, the CONFIRMED-live override path.
+    `lpn_id` is accepted for shape-compatibility with the earlier
+    core-API-only retry design but is unused once the DMM path is taken
+    — that workflow always mints its own iLPN (see
+    `receive_via_dmm_workflow()`'s docstring).
     """
     if not transaction_id or not receiving_strategy:
         return {"success": False, "error": "Transaction ID is required"}
@@ -550,6 +683,34 @@ def receive_line(
     else:
         return {"success": False, "error": f"Unknown mode: {mode}"}
 
+    if warning_overrides:
+        dmm_result = receive_via_dmm_workflow(
+            asn_id,
+            state["itemId"],
+            qty_base,
+            transaction_id,
+            token,
+            org,
+            location=state["dest"],
+            staging_location_id=staging_location_id or None,
+            warning_overrides=warning_overrides,
+        )
+        ok = bool(dmm_result.get("success"))
+        warning = bool(dmm_result.get("warning"))
+        return {
+            "success": ok,
+            "warning": warning,
+            "messageId": dmm_result.get("messageId"),
+            "messageText": dmm_result.get("messageText"),
+            "lpnId": dmm_result.get("lpnId") or lpn_id,
+            "itemId": state["itemId"],
+            "quantityBase": _num(qty_base),
+            "quantityDisplay": _num(qty_base / factor),
+            "displayUom": state["displayUom"],
+            "mawmResponse": dmm_result.get("mawmResponse"),
+            "error": dmm_result.get("error") or dmm_result.get("messageText"),
+        }
+
     if not lpn_id:
         lpn_ids = generate_ilpn_ids(1, token, org, location=state["dest"])
         lpn_id = lpn_ids[0]
@@ -564,7 +725,6 @@ def receive_line(
         transaction_id=transaction_id,
         receiving_strategy=receiving_strategy,
         staging_location_id=staging_location_id or None,
-        warning_overrides=warning_overrides,
     )
     warning = extract_warning(result) if isinstance(result, dict) else None
     http_ok = result.get("_httpOk", True) if isinstance(result, dict) else True
