@@ -590,10 +590,15 @@
             (result.messageText || result.messageId || "unknown warning"),
         };
       }
+      // The busy overlay sits above every modal (z-index 1100) so a user
+      // can't be left staring at a spinner mid-operation; drop it while
+      // waiting on the Confirm/Cancel decision, restore it for the retry.
+      setBusy(false);
       const confirmed = await showWarningModal(result.messageId, result.messageText);
       if (!confirmed) {
         return { success: false, cancelled: true, error: "Cancelled after warning." };
       }
+      setBusy(true, "Receiving…");
       overrides[result.messageId] = result.messageId;
       lpnId = result.lpnId;
       result = await callReceiveLine(asnLineId, mode, quantity, lpnId, overrides);
