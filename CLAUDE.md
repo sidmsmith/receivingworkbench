@@ -29,25 +29,41 @@ need this — use judgment, and ask if unsure whether a change counts as
 - Never commit `.token`, credentials, or other gitignored secrets.
 - Never force-push or amend unless the user explicitly asks.
 
-## Warning message handling — not yet implemented (see taskcompletion)
+## Warning message handling — detection/UI done, override still blocked (2026-08-08)
 
-This app does not currently detect or handle MAWM **warnings** (as
-opposed to hard errors) at all. `receive_lpn()`
-(`mawm_client.py:330`) raises a hard `RuntimeError` on any non-2xx
-HTTP status before the caller ever sees the parsed body — flagged by
-the existing `TODO(testing)` comments at `mawm_client.py:358-360` and
-`rw_service.py:538-539` (large `Quantity` may trip the item's
-`MaxLpnQuantity` and come back as a warning, not handled). When it's
-time to fix this, don't start from scratch — a sibling app,
-`taskcompletion` (`../taskcompletion`), built and confirmed this exact
-pattern live for Putaway. Read `taskcompletion/CLAUDE.md` in full
-before touching this; short version:
+Items 1-4 below are implemented: `receive_lpn()` (`mawm_client.py`)
+always parses the response body now and only raises on a genuinely
+unparseable one; `extract_warning()`/`extract_message()` were ported
+from `taskcompletion/mawm_client.py`; `rw_service.receive_line()`
+detects a WARNING and returns `{warning: True, messageId, messageText,
+lpnId, ...}` instead of treating it as success; `public/app.js` has a
+Confirm/Cancel `warningModal` plus `receiveLineWithWarningHandling()`,
+a retry loop that reuses the same generated iLPN (via the new
+`lpnId`/`warningOverrides` params threaded through
+`api/index.py`'s `/api/receive_line` → `rw_service.receive_line()` →
+`mawm_client.receive_lpn()`) rather than minting a fresh one per
+retry attempt.
 
-- **The bug to fix first is the same class of bug**: MAWM returns at
-  least some warnings over a non-2xx HTTP status. Raising early (like
-  `receive_lpn()` does now) throws the warning away before it can be
-  inspected. Fix: always parse and return the response body; only
-  raise if the body is genuinely unparseable. See
+**Still open — item 5, the actual override contract.** `receive_lpn()`
+accepts `warning_overrides` but deliberately does nothing with it yet:
+there's no known override mechanism for a plain core-API endpoint like
+`receiving/lpn/receive` (see below — the DMM shape doesn't carry over,
+and the obvious guess is confirmed wrong on a similar core endpoint).
+Until the real contract is known, `receiveLineWithWarningHandling()`
+guards against looping forever on an unclearable warning: if the exact
+same `messageId` comes back a second time after already being
+confirmed once, it stops and surfaces a plain "could not be cleared"
+error instead of reshowing the modal. Once a HAR capture (see below)
+reveals the real request shape, wire it into `receive_lpn()` where the
+`# warning_overrides is intentionally not applied to the payload yet`
+comment is.
+
+Read `taskcompletion/CLAUDE.md` in full before touching the override
+side; short version of how Putaway solved the equivalent problem:
+
+- **The bug fixed first was the same class of bug**: MAWM returns at
+  least some warnings over a non-2xx HTTP status. Raising early throws
+  the warning away before it can be inspected. See
   `taskcompletion/mawm_client.py`'s `fetch_putaway_move()`/
   `commit_putaway_move()`/`workflow_init()`/`workflow_execute()` for
   the pattern, and that repo's CLAUDE.md entry "Bug fixed 2026-08-08"

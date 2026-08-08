@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from mawm_client import (
     asn_status_description,
+    extract_message,
+    extract_warning,
     generate_ilpn_ids,
     lpn_status_description,
     qty_for_payload,
@@ -489,6 +491,8 @@ def receive_line(
     quantity_display: Optional[float] = None,
     location: str = None,
     staging_location_id: str = None,
+    lpn_id: Optional[str] = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Receive against one ASN line — mode "full" or "partial".
 
@@ -502,6 +506,20 @@ def receive_line(
     Transaction ID picker is a required field (disables Full/Partial/All
     Lines until one's chosen), so a blank here means the frontend didn't
     enforce that; fail rather than silently falling back to a default.
+
+    `lpn_id`/`warning_overrides` back the Confirm/Cancel warning retry
+    (see CLAUDE.md's "Warning message handling" section): the frontend's
+    first call for a given attempt leaves `lpn_id` unset, so a fresh
+    iLPN is generated. If the result comes back `warning: True`, the
+    frontend shows a Confirm/Cancel modal and, on Confirm, resubmits
+    with that same `lpn_id` (so a retry doesn't abandon a freshly
+    generated, never-received iLPN per attempt and mint another) plus
+    the warning's code folded into `warning_overrides`. The override
+    itself isn't confirmed to clear anything against MAWM yet — see
+    mawm_client.receive_lpn()'s docstring — so today a retry mostly just
+    resubmits the identical request and will likely surface the same
+    warning again until the real override contract is learned from a
+    HAR capture.
     """
     if not transaction_id or not receiving_strategy:
         return {"success": False, "error": "Transaction ID is required"}
@@ -532,12 +550,10 @@ def receive_line(
     else:
         return {"success": False, "error": f"Unknown mode: {mode}"}
 
-    lpn_ids = generate_ilpn_ids(1, token, org, location=state["dest"])
-    lpn_id = lpn_ids[0]
+    if not lpn_id:
+        lpn_ids = generate_ilpn_ids(1, token, org, location=state["dest"])
+        lpn_id = lpn_ids[0]
 
-    # TODO(testing): large qty_base may trip the item's MaxLpnQuantity on
-    # MAWM's side (warning or error) — not handled yet, see receive_lpn()
-    # and CLAUDE.md's "Warning message handling" section.
     result = receive_lpn(
         asn_id,
         lpn_id,
@@ -548,15 +564,23 @@ def receive_line(
         transaction_id=transaction_id,
         receiving_strategy=receiving_strategy,
         staging_location_id=staging_location_id or None,
+        warning_overrides=warning_overrides,
     )
-    ok = result.get("success", True) if isinstance(result, dict) else True
+    warning = extract_warning(result) if isinstance(result, dict) else None
+    http_ok = result.get("_httpOk", True) if isinstance(result, dict) else True
+    ok = http_ok and not warning
     return {
         "success": bool(ok),
+        "warning": bool(warning),
+        "messageId": (warning or {}).get("code") or None,
+        "messageText": (warning or {}).get("text") or None,
         "lpnId": lpn_id,
         "itemId": state["itemId"],
         "quantityBase": _num(qty_base),
         "quantityDisplay": _num(qty_base / factor),
         "displayUom": state["displayUom"],
         "mawmResponse": result,
-        "error": None if ok else (result.get("message") or result.get("error") or "Receive failed"),
+        "error": None if ok else (
+            extract_message(result) if isinstance(result, dict) else "Receive failed"
+        ),
     }

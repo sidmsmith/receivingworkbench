@@ -337,6 +337,7 @@ def receive_lpn(
     transaction_id: str = "Receiving",
     receiving_strategy: str = "Receiving Strategy",
     staging_location_id: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
 ) -> dict:
     """POST receiving/lpn/receive — books received quantity against a new LPN.
 
@@ -355,14 +356,18 @@ def receive_lpn(
     The defaults here ("Receiving" / "Receiving Strategy") only apply if
     a caller doesn't supply them.
 
-    TODO(testing): for a large Quantity, MAWM may reject/warn if it exceeds
-    the item's max LPN quantity (item master). Not handled yet — needs a
-    real test against an item with a MaxLpnQuantity set. See CLAUDE.md's
-    "Warning message handling" section before starting this: the
-    non-2xx short-circuit below throws away exactly this kind of
-    warning today, and a sibling app (taskcompletion) already worked
-    out the fix and detection/override pattern for the same class of
-    bug.
+    `warning_overrides` — best-effort, UNCONFIRMED. A large Quantity may
+    trip the item's MaxLpnQuantity (item master) and come back as a
+    WARNING (see extract_warning()) rather than a hard error. Unlike
+    taskcompletion's DMM Mobile Facade flow, there's no known override
+    contract yet for this plain core-API endpoint — taskcompletion
+    confirmed a guessed `userInputs: {code: code}` shape does NOT clear
+    a warning on a similar core endpoint
+    (`putaway/api/putaway/execution/container/move`), so this
+    deliberately does not resend that same known-wrong guess. See
+    CLAUDE.md's "Warning message handling" section — the real contract
+    still needs a HAR capture of a live receiving warning before this
+    parameter can do anything.
     """
     token = normalize_token(token)
     payload = {
@@ -374,6 +379,9 @@ def receive_lpn(
     }
     if staging_location_id:
         payload["LocationId"] = staging_location_id
+    # warning_overrides is intentionally not applied to the payload yet —
+    # see the docstring above. Accepted now so the caller/frontend retry
+    # loop can be built ahead of the override contract being known.
     response = _post(
         LPN_RECEIVE_URL,
         headers=build_receiving_headers(token, org, location=location),
@@ -383,13 +391,56 @@ def receive_lpn(
         body = response.json()
     except Exception:
         body = {"raw": response.text[:1200]}
-    if response.status_code not in (200, 201):
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
         raise RuntimeError(
             f"lpn/receive failed: {response.status_code} {response.text[:800]}"
         )
-    if isinstance(body, dict):
-        body["_requestPayload"] = payload
-    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    body["_requestPayload"] = payload
+    body["_httpOk"] = response.status_code in (200, 201)
+    return body
+
+
+def extract_warning(body) -> Optional[Dict[str, str]]:
+    """Best-effort scan for an overrideable WARNING in a MAWM response.
+
+    Checks the standard `messages.Message[]` envelope (Type=="WARNING").
+    Ported from taskcompletion/mawm_client.py's extract_warning() —
+    receiving only ever hits a plain core-API endpoint here, not a DMM
+    Mobile Facade workflow, so the `workflowVO.header.state.errorVOList`
+    branch that function also checks doesn't apply and is left out.
+    """
+    if not isinstance(body, dict):
+        return None
+    for msg in ((body.get("messages") or {}).get("Message") or []):
+        if not isinstance(msg, dict):
+            continue
+        category = str(msg.get("Type") or msg.get("Category") or "").upper()
+        if category == "WARNING":
+            return {
+                "code": str(msg.get("Code") or msg.get("MessageKey") or ""),
+                "text": str(msg.get("Description") or msg.get("Message") or ""),
+            }
+    return None
+
+
+def extract_message(body) -> str:
+    """Best-effort human-readable message for a failed response.
+
+    Prefers the first `messages.Message[].Description` (any Type, not
+    just WARNING) over the generic top-level `message`/`messageKey`
+    (often just an opaque code like `"error.400"`). Ported from
+    taskcompletion/mawm_client.py's extract_message().
+    """
+    if not isinstance(body, dict):
+        return "Receive failed"
+    for msg in ((body.get("messages") or {}).get("Message") or []):
+        if isinstance(msg, dict):
+            text = str(msg.get("Description") or msg.get("Message") or "").strip()
+            if text:
+                return text
+    return str(body.get("message") or body.get("messageKey") or "Receive failed")
 
 
 def search_inventory_by_container_item(

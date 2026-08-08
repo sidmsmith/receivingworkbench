@@ -56,6 +56,9 @@
     partialLineConfirmBtn: document.getElementById("partialLineConfirmBtn"),
     allLinesList: document.getElementById("allLinesList"),
     allLinesConfirmBtn: document.getElementById("allLinesConfirmBtn"),
+    warningMessageId: document.getElementById("warningMessageId"),
+    warningMessageText: document.getElementById("warningMessageText"),
+    warningConfirmBtn: document.getElementById("warningConfirmBtn"),
     busyOverlay: document.getElementById("busyOverlay"),
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
@@ -518,7 +521,7 @@
     return rem > 0 ? rem : 0;
   }
 
-  async function callReceiveLine(asnLineId, mode, quantity) {
+  async function callReceiveLine(asnLineId, mode, quantity, lpnId, warningOverrides) {
     return api("receive_line", {
       org: state.org,
       token: state.token,
@@ -530,7 +533,72 @@
       stagingLocationId: state.stagingLocationId || "",
       transactionId: state.selectedTransactionId || "",
       receivingStrategy: state.selectedStrategyId || "",
+      lpnId: lpnId || "",
+      warningOverrides: warningOverrides || undefined,
     });
+  }
+
+  function showWarningModal(messageId, messageText) {
+    return new Promise((resolve) => {
+      let resolved = false;
+      function finish(result) {
+        if (resolved) return;
+        resolved = true;
+        el.warningConfirmBtn.removeEventListener("click", onConfirm);
+        warningModalEl.removeEventListener("hidden.bs.modal", onHidden);
+        resolve(result);
+      }
+      function onConfirm() {
+        warningModal.hide();
+        finish(true);
+      }
+      function onHidden() {
+        finish(false);
+      }
+      el.warningMessageId.textContent = messageId || "";
+      el.warningMessageText.textContent = messageText || "";
+      el.warningConfirmBtn.addEventListener("click", onConfirm);
+      warningModalEl.addEventListener("hidden.bs.modal", onHidden);
+      warningModal.show();
+    });
+  }
+
+  /**
+   * Calls receive_line, and if the response comes back with a MAWM
+   * warning (`result.warning === true`), shows the Confirm/Cancel modal
+   * and — on Confirm — retries with the same generated LPN plus that
+   * warning's code added to warningOverrides (see rw_service.receive_line()
+   * for why the LPN is reused rather than re-generated per attempt).
+   * Loops in case a second, different warning follows the first
+   * confirmation. The override mechanism isn't confirmed to actually
+   * clear anything against MAWM yet (see CLAUDE.md's "Warning message
+   * handling" section) — if the identical warning code comes back again
+   * after already being confirmed once, this stops retrying and returns
+   * a plain failure instead of looping forever on the same warning.
+   */
+  async function receiveLineWithWarningHandling(asnLineId, mode, quantity) {
+    const overrides = {};
+    let lpnId = "";
+    let result = await callReceiveLine(asnLineId, mode, quantity, lpnId, overrides);
+    while (result && result.warning) {
+      if (Object.prototype.hasOwnProperty.call(overrides, result.messageId)) {
+        return {
+          success: false,
+          warning: true,
+          error:
+            "Warning could not be cleared (override not yet supported for receiving): " +
+            (result.messageText || result.messageId || "unknown warning"),
+        };
+      }
+      const confirmed = await showWarningModal(result.messageId, result.messageText);
+      if (!confirmed) {
+        return { success: false, cancelled: true, error: "Cancelled after warning." };
+      }
+      overrides[result.messageId] = result.messageId;
+      lpnId = result.lpnId;
+      result = await callReceiveLine(asnLineId, mode, quantity, lpnId, overrides);
+    }
+    return result;
   }
 
   async function receiveFullLine() {
@@ -543,7 +611,7 @@
     }
     setBusy(true, "Receiving line " + line.lineNumber + "…");
     try {
-      const result = await callReceiveLine(line.asnLineId, "full");
+      const result = await receiveLineWithWarningHandling(line.asnLineId, "full");
       if (!result.success) {
         setActionStatus(result.error || "Receive failed", "error");
         return;
@@ -600,7 +668,7 @@
     partialLineModal.hide();
     setBusy(true, "Receiving line " + line.lineNumber + "…");
     try {
-      const result = await callReceiveLine(line.asnLineId, "partial", qty);
+      const result = await receiveLineWithWarningHandling(line.asnLineId, "partial", qty);
       if (!result.success) {
         setActionStatus(result.error || "Receive failed", "error");
         return;
@@ -646,7 +714,7 @@
       const line = allLinesPending[i];
       setBusy(true, "Receiving line " + (i + 1) + " of " + total + "…");
       try {
-        const result = await callReceiveLine(line.asnLineId, "full");
+        const result = await receiveLineWithWarningHandling(line.asnLineId, "full");
         if (result.success) {
           succeeded++;
         } else {
@@ -695,6 +763,8 @@
   const allLinesModal = window.bootstrap
     ? new window.bootstrap.Modal(document.getElementById("allLinesModal"))
     : null;
+  const warningModalEl = document.getElementById("warningModal");
+  const warningModal = window.bootstrap ? new window.bootstrap.Modal(warningModalEl) : null;
 
   el.fullLineBtn.addEventListener("click", receiveFullLine);
   el.partialLineBtn.addEventListener("click", openPartialModal);

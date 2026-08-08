@@ -27,7 +27,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "receivingworkbench-app"
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.12"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -237,6 +237,10 @@ def receive_line_route():
     staging_location_id = (data.get("stagingLocationId") or data.get("staging_location_id") or "").strip()
     transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
     receiving_strategy = (data.get("receivingStrategy") or data.get("receiving_strategy") or "").strip()
+    lpn_id = (data.get("lpnId") or data.get("lpn_id") or "").strip()
+    warning_overrides = data.get("warningOverrides") or data.get("warning_overrides")
+    if not isinstance(warning_overrides, dict):
+        warning_overrides = None
     if not asn_id or not asn_line_id:
         return jsonify({"success": False, "error": "asnId and asnLineId required"})
     if not transaction_id or not receiving_strategy:
@@ -253,12 +257,19 @@ def receive_line_route():
             quantity_display=quantity,
             location=location,
             staging_location_id=staging_location_id or None,
+            lpn_id=lpn_id or None,
+            warning_overrides=warning_overrides,
+        )
+        event_name = (
+            "receive_line_completed" if result.get("success")
+            else "receive_line_warning" if result.get("warning")
+            else "receive_line_failed"
         )
         forward_usage_event(
             {
                 "app_name": APP_NAME,
                 "app_version": APP_VERSION,
-                "event_name": "receive_line_completed" if result.get("success") else "receive_line_failed",
+                "event_name": event_name,
                 "org": org,
                 "asnId": asn_id,
                 "asnLineId": asn_line_id,
