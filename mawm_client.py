@@ -357,7 +357,12 @@ def receive_lpn(
 
     TODO(testing): for a large Quantity, MAWM may reject/warn if it exceeds
     the item's max LPN quantity (item master). Not handled yet — needs a
-    real test against an item with a MaxLpnQuantity set.
+    real test against an item with a MaxLpnQuantity set. See CLAUDE.md's
+    "Warning message handling" section before starting this: the
+    non-2xx short-circuit below throws away exactly this kind of
+    warning today, and a sibling app (taskcompletion) already worked
+    out the fix and detection/override pattern for the same class of
+    bug.
     """
     token = normalize_token(token)
     payload = {

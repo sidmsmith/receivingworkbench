@@ -536,7 +536,8 @@ def receive_line(
     lpn_id = lpn_ids[0]
 
     # TODO(testing): large qty_base may trip the item's MaxLpnQuantity on
-    # MAWM's side (warning or error) — not handled yet, see receive_lpn().
+    # MAWM's side (warning or error) — not handled yet, see receive_lpn()
+    # and CLAUDE.md's "Warning message handling" section.
     result = receive_lpn(
         asn_id,
         lpn_id,
